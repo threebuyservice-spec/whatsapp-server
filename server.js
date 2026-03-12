@@ -202,6 +202,24 @@ app.post("/sessions/:sessionId/connect", async (req, res) => {
   }
 });
 
+// **مسیر جدید GET /send برای مرورگر**
+app.get("/send", async (req, res) => {
+  const to = req.query.to;
+  const message = req.query.message;
+  if (!to || !message) return res.send({ status: false, message: "to or message missing" });
+
+  try {
+    const session = sessions.get(DEFAULT_SESSION_ID);
+    if (!session || session.status !== "connected") {
+      return res.send({ status: false, message: "WhatsApp not connected yet" });
+    }
+    await session.sock.sendMessage(to + '@s.whatsapp.net', { text: message });
+    res.send({ status: true, message: "Sent successfully" });
+  } catch (err) {
+    res.send({ status: false, message: err.message });
+  }
+});
+
 // Health
 app.get("/health", (_req, res) => {
   res.json({ status: true, sessions: sessions.size, timestamp: nowIso() });
