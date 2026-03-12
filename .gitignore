@@ -1,0 +1,4 @@
+node_modules/
+auth_info/
+.DS_Store
+*.log
