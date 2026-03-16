@@ -2,6 +2,7 @@ const express = require("express");
 const fs = require("fs/promises");
 const path = require("path");
 const QRCode = require("qrcode");
+const { createClient } = require("@supabase/supabase-js");
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, DisconnectReason } = require("@whiskeysockets/baileys");
 
 const app = express();
@@ -12,6 +13,11 @@ const AUTH_ROOT = path.resolve(process.env.AUTH_ROOT || "auth_info");
 const DEFAULT_SESSION_ID = process.env.DEFAULT_SESSION_ID || "default";
 const RECONNECT_DELAY_MS = Number(process.env.RECONNECT_DELAY_MS || 3000);
 const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
+
+// اتصال به دیتابیس سوپابیس
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://kbnbbbnbaukbdzehkkzz.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BInnovation'; // Use real key here or ENV
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const sessions = new Map();
 let cachedBaileysVersion;
@@ -78,6 +84,9 @@ async function closeSession(session, { logout = false, removeAuth = false } = {}
   session.status = "closed";
   session.updatedAt = nowIso();
 
+  // آپدیت وضعیت دیتابیس هنگام بسته شدن
+  await updateSupabaseDevice(session.id, { status: "disconnected", qr_code: null });
+
   if (removeAuth && session.authDir) {
     await fs.rm(session.authDir, { recursive: true, force: true });
   }
@@ -98,6 +107,19 @@ function scheduleReconnect(session) {
       scheduleReconnect(session);
     });
   }, RECONNECT_DELAY_MS);
+}
+
+// متد کمکی برای بروزرسانی وضعیت در دیتابیس Supabase
+async function updateSupabaseDevice(deviceId, data) {
+  try {
+    const { error } = await supabase
+      .from('devices')
+      .update(data)
+      .eq('id', deviceId); // فرض می‌کنیم SessionId همان deviceId است
+    if (error) console.error(`[DB Error ${deviceId}]`, error.message);
+  } catch (err) {
+    console.error(`[DB Exception ${deviceId}]`, err);
+  }
 }
 
 async function connectSession(sessionId) {
@@ -145,6 +167,13 @@ async function connectSession(sessionId) {
         session.qrDataUrl = await QRCode.toDataURL(qr);
         session.status = "qr_ready";
         session.updatedAt = nowIso();
+        
+        console.log(`[${session.id}] New QR stored in database`);
+        await updateSupabaseDevice(session.id, { 
+          qr_code: session.qrDataUrl,
+          status: "scanning" 
+        });
+
       } catch (err) {
         session.status = "error";
         session.lastError = err?.message || String(err);
@@ -160,6 +189,11 @@ async function connectSession(sessionId) {
       session.lastError = null;
       session.updatedAt = nowIso();
       console.log(`[${session.id}] WhatsApp connected`);
+      
+      await updateSupabaseDevice(session.id, { 
+        status: "connected",
+        qr_code: null 
+      });
     }
 
     if (connection === "close") {
