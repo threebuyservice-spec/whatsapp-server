@@ -16,7 +16,7 @@ const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
 
 // اتصال به دیتابیس سوپابیس
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://kbnbbbnbaukbdzehkkzz.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BInnovation'; // Use real key here or ENV
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BJoMM';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const sessions = new Map();
@@ -110,15 +110,15 @@ function scheduleReconnect(session) {
 }
 
 // متد کمکی برای بروزرسانی وضعیت در دیتابیس Supabase
-async function updateSupabaseDevice(deviceId, data) {
+async function updateSupabaseDevice(sessionId, data) {
   try {
     const { error } = await supabase
       .from('devices')
       .update(data)
-      .eq('id', deviceId); // فرض می‌کنیم SessionId همان deviceId است
-    if (error) console.error(`[DB Error ${deviceId}]`, error.message);
+      .eq('session_data', sessionId); // اصلاح شد: جستجو بر اساس session_data
+    if (error) console.error(`[DB Error ${sessionId}]`, error.message);
   } catch (err) {
-    console.error(`[DB Exception ${deviceId}]`, err);
+    console.error(`[DB Exception ${sessionId}]`, err);
   }
 }
 
