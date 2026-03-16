@@ -190,9 +190,21 @@ async function connectSession(sessionId) {
       session.updatedAt = nowIso();
       console.log(`[${session.id}] WhatsApp connected`);
       
+      // دریافت اطلاعات پروفایل از واتساپ
+      const user = sock.user;
+      let profileName = user?.name || user?.verifiedName || user?.id.split(':')[0];
+      let profilePic = null;
+      try {
+        profilePic = await sock.profilePictureUrl(user.id, 'image').catch(() => null);
+      } catch (e) {}
+
       await updateSupabaseDevice(session.id, { 
         status: "connected",
-        qr_code: null 
+        phone_number: user?.id.split(':')[1].split('@')[0] || user?.id.split(':')[0],
+        name: profileName || "WhatsApp Device",
+        qr_code: null,
+        // اگر ستون profile_picture دارید، آن را هم آپدیت کنید؛ در غیر این صورت فیلد اختیاری است.
+        // session_data: sessionId در متد updateSupabaseDevice استفاده می‌شود.
       });
     }
 
