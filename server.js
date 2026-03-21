@@ -17,12 +17,13 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = Number(process.env.PORT || 3000);
 const AUTH_ROOT = path.resolve(process.env.AUTH_ROOT || "auth_info");
 const DEFAULT_SESSION_ID = process.env.DEFAULT_SESSION_ID || "default";
-const RECONNECT_DELAY_MS = Number(process.env.RECONNECT_DELAY_MS || 3000);
+const RECONNECT_DELAY_MS = Number(process.env.RECONNECT_DELAY_MS || 5000);
 const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
 
-// ─── حداقل فاصله بین ذخیره دو QR متوالی (میلی‌ثانیه) ───────────────────────
-// Baileys هر ~20 ثانیه یک QR جدید می‌سازه؛ ما اون رو max هر 30 ثانیه ذخیره می‌کنیم
-const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 30_000);
+// ── How long to wait before saving a NEW QR to DB (ms) ──────────────────────
+// Baileys regenerates QR every ~20s. We only push to DB once per this window.
+// Set to 0 if you want every QR saved (not recommended).
+const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 25_000);
 
 const SUPABASE_URL =
   process.env.SUPABASE_URL || "https://kbnbbbnbaukbdzehkkzz.supabase.co";
@@ -31,8 +32,13 @@ const SUPABASE_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BJoMM";
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// ── Sessions map & a Set to prevent concurrent connects ─────────────────────
 const sessions = new Map();
+const connectingNow = new Set(); // prevents double-connect race condition
+
 let cachedBaileysVersion;
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function nowIso() {
   return new Date().toISOString();
@@ -59,9 +65,8 @@ function getOrCreateSession(id) {
       lastError: null,
       updatedAt: nowIso(),
       authDir: null,
-      // ── فیلدهای جدید برای کنترل QR ──────────────────────────────────────
-      lastQrSavedAt: 0,       // timestamp آخرین باری که QR در DB ذخیره شد
-      qrSaveCount: 0,         // تعداد دفعاتی که QR ذخیره شده (برای debug)
+      lastQrSavedAt: 0,   // timestamp of last QR push to DB
+      qrSaveCount: 0,     // debug counter
     });
   }
   return sessions.get(id);
@@ -87,6 +92,7 @@ function clearReconnectTimer(session) {
   session.reconnectTimer = null;
 }
 
+// ── Supabase helper ──────────────────────────────────────────────────────────
 async function updateSupabaseDevice(sessionId, data) {
   try {
     const { error } = await supabase
@@ -99,17 +105,14 @@ async function updateSupabaseDevice(sessionId, data) {
   }
 }
 
+// ── Close session ────────────────────────────────────────────────────────────
 async function closeSession(session, { logout = false, removeAuth = false } = {}) {
   session.shouldReconnect = false;
   clearReconnectTimer(session);
 
   if (session.sock) {
-    try {
-      if (logout) await session.sock.logout();
-    } catch {}
-    try {
-      if (session.sock.end) session.sock.end(new Error("Session closed"));
-    } catch {}
+    try { if (logout) await session.sock.logout(); } catch {}
+    try { if (session.sock.end) session.sock.end(new Error("Session closed")); } catch {}
   }
 
   session.sock = null;
@@ -124,6 +127,7 @@ async function closeSession(session, { logout = false, removeAuth = false } = {}
   }
 }
 
+// ── Schedule reconnect ───────────────────────────────────────────────────────
 function scheduleReconnect(session) {
   if (!session.shouldReconnect) return;
   clearReconnectTimer(session);
@@ -131,7 +135,7 @@ function scheduleReconnect(session) {
   session.reconnectAttempts += 1;
   session.updatedAt = nowIso();
 
-  // ── وقتی reconnect می‌شه، throttle رو ریست می‌کنیم تا اولین QR جدید سریع ذخیره بشه
+  // Reset throttle so first QR after reconnect saves immediately
   session.lastQrSavedAt = 0;
 
   session.reconnectTimer = setTimeout(() => {
@@ -144,9 +148,11 @@ function scheduleReconnect(session) {
   }, RECONNECT_DELAY_MS);
 }
 
-// ─── هندلر QR با throttle ────────────────────────────────────────────────────
-async function handleQR(session, sock, qr) {
-  // QR رو همیشه در حافظه (RAM) ذخیره می‌کنیم تا endpoint /qr/image فوری جواب بده
+// ── QR handler with throttle ─────────────────────────────────────────────────
+// Always stores QR in RAM for the /qr/image endpoint.
+// Only pushes to Supabase DB at most once per QR_THROTTLE_MS window.
+async function handleQR(session, qr) {
+  // 1. Generate data URL (always, so /qr/image always has latest)
   let dataUrl;
   try {
     dataUrl = await QRCode.toDataURL(qr);
@@ -161,22 +167,23 @@ async function handleQR(session, sock, qr) {
   session.status = "qr_ready";
   session.updatedAt = nowIso();
 
-  // ── throttle: فقط اگه از آخرین ذخیره در DB به اندازه کافی گذشته باشه ──────
+  // 2. Throttle DB writes
   const now = Date.now();
   const elapsed = now - session.lastQrSavedAt;
 
   if (elapsed < QR_THROTTLE_MS) {
+    // QR is fresh in RAM but we skip the DB write this time
     console.log(
-      `[${session.id}] QR generated but throttled (${Math.round(elapsed / 1000)}s < ${QR_THROTTLE_MS / 1000}s). DB skipped.`
+      `[${session.id}] QR generated — DB write skipped (throttled, ${Math.round(elapsed / 1000)}s elapsed of ${QR_THROTTLE_MS / 1000}s window)`
     );
-    return; // QR در حافظه هست ولی DB آپدیت نمی‌شه
+    return;
   }
 
-  // ── QR اول یا بعد از گذشت زمان کافی → ذخیره در DB ────────────────────────
+  // 3. Save to DB
   session.lastQrSavedAt = now;
   session.qrSaveCount += 1;
   console.log(
-    `[${session.id}] QR #${session.qrSaveCount} saved to DB (elapsed: ${Math.round(elapsed / 1000)}s)`
+    `[${session.id}] QR #${session.qrSaveCount} saved to DB`
   );
 
   await updateSupabaseDevice(session.id, {
@@ -185,145 +192,146 @@ async function handleQR(session, sock, qr) {
   });
 }
 
+// ── Main connect function ────────────────────────────────────────────────────
 async function connectSession(sessionId) {
   const id = sanitizeSessionId(sessionId);
-  if (!id)
-    throw new Error("Invalid sessionId. Use 2-64 chars: a-z, 0-9, _ or -");
+  if (!id) throw new Error("Invalid sessionId. Use 2-64 chars: a-z, 0-9, _ or -");
 
-  const session = getOrCreateSession(id);
-  session.shouldReconnect = true;
-  session.lastError = null;
-  session.updatedAt = nowIso();
-
-  // ── اولین اتصال: throttle رو ریست کن تا اولین QR سریع ذخیره بشه ──────────
-  session.lastQrSavedAt = 0;
-
-  clearReconnectTimer(session);
-
-  if (session.sock) {
-    try {
-      session.sock.end(new Error("Restarting session"));
-    } catch {}
+  // ── GUARD: prevent two simultaneous connects for the same session ─────────
+  if (connectingNow.has(id)) {
+    console.warn(`[${id}] connectSession called while already connecting — ignored`);
+    return getOrCreateSession(id);
   }
-  session.sock = null;
+  connectingNow.add(id);
 
-  const authDir = await resolveAuthDir(id);
-  session.authDir = authDir;
-  await fs.mkdir(authDir, { recursive: true });
+  try {
+    const session = getOrCreateSession(id);
+    session.shouldReconnect = true;
+    session.lastError = null;
+    session.lastQrSavedAt = 0; // reset throttle on fresh connect
+    session.updatedAt = nowIso();
+    clearReconnectTimer(session);
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const version = await getBaileysVersion();
-
-  const sock = makeWASocket({
-    auth: state,
-    browser: Browsers.macOS("Desktop"),
-    version,
-    connectTimeoutMs: 60_000,
-    defaultQueryTimeoutMs: 60_000,
-    shouldSyncHistoryMessage: () => false,
-  });
-
-  session.sock = sock;
-  session.status = "connecting";
-  session.qrDataUrl = null;
-  session.updatedAt = nowIso();
-
-  sock.ev.on("creds.update", (...args) => {
-    if (session.sock === sock) saveCreds(...args);
-  });
-
-  sock.ev.on("connection.update", async (update) => {
-    if (session.sock !== sock) return; // socket قدیمی → نادیده بگیر
-
-    const { connection, qr, lastDisconnect } = update;
-
-    // ── QR دریافت شد ─────────────────────────────────────────────────────────
-    if (qr) {
-      await handleQR(session, sock, qr);
+    // Tear down any existing socket cleanly
+    if (session.sock) {
+      try { session.sock.end(new Error("Restarting session")); } catch {}
+      session.sock = null;
     }
 
-    // ── اتصال برقرار شد ───────────────────────────────────────────────────────
-    if (connection === "open") {
-      session.status = "connected";
-      session.qrDataUrl = null;
-      session.reconnectAttempts = 0;
-      session.lastDisconnectCode = null;
-      session.lastError = null;
-      session.lastQrSavedAt = 0; // ریست برای اتصال بعدی
-      session.updatedAt = nowIso();
-      console.log(`[${session.id}] WhatsApp connected`);
+    const authDir = await resolveAuthDir(id);
+    session.authDir = authDir;
+    await fs.mkdir(authDir, { recursive: true });
 
-      const user = sock.user;
-      let profileName =
-        user?.name || user?.verifiedName || user?.id?.split(":")[0];
-      let phoneNumber =
-        user?.id?.split(":")[1]?.split("@")[0] || user?.id?.split(":")[0];
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const version = await getBaileysVersion();
 
-      // پاک کردن QR از DB بعد از اتصال موفق
-      await updateSupabaseDevice(session.id, {
-        status: "connected",
-        phone_number: phoneNumber,
-        name: profileName || "WhatsApp Device",
-        qr_code: null,
-      });
-    }
+    const sock = makeWASocket({
+      auth: state,
+      browser: Browsers.macOS("Desktop"),
+      version,
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+      shouldSyncHistoryMessage: () => false,
+    });
 
-    // ── اتصال قطع شد ─────────────────────────────────────────────────────────
-    if (connection === "close") {
-      session.lastDisconnectCode =
-        lastDisconnect?.error?.output?.statusCode ?? null;
-      session.updatedAt = nowIso();
-      console.log(
-        `[${session.id}] Disconnected`,
-        session.lastDisconnectCode || ""
-      );
+    session.sock = sock;
+    session.status = "connecting";
+    session.qrDataUrl = null;
+    session.updatedAt = nowIso();
 
-      if (session.lastDisconnectCode === DisconnectReason.loggedOut) {
-        session.status = "logged_out";
-        session.shouldReconnect = false;
-        session.qrDataUrl = null;
-        await updateSupabaseDevice(session.id, {
-          status: "disconnected",
-          qr_code: null,
-        });
-        return;
+    sock.ev.on("creds.update", (...args) => {
+      if (session.sock === sock) saveCreds(...args);
+    });
+
+    sock.ev.on("connection.update", async (update) => {
+      // Stale socket check — ignore events from old sockets
+      if (session.sock !== sock) return;
+
+      const { connection, qr, lastDisconnect } = update;
+
+      // ── QR received ──────────────────────────────────────────────────────
+      if (qr) {
+        await handleQR(session, qr);
       }
 
-      scheduleReconnect(session);
-    }
-  });
+      // ── Connected ────────────────────────────────────────────────────────
+      if (connection === "open") {
+        session.status = "connected";
+        session.qrDataUrl = null;
+        session.reconnectAttempts = 0;
+        session.lastDisconnectCode = null;
+        session.lastError = null;
+        session.lastQrSavedAt = 0;
+        session.updatedAt = nowIso();
+        console.log(`[${id}] WhatsApp connected`);
 
-  return session;
+        const user = sock.user;
+        const phoneNumber =
+          user?.id?.split(":")?.[1]?.split("@")?.[0] ||
+          user?.id?.split(":")?.[0] ||
+          null;
+        const profileName =
+          user?.name || user?.verifiedName || phoneNumber || "WhatsApp Device";
+
+        await updateSupabaseDevice(id, {
+          status: "connected",
+          phone_number: phoneNumber,
+          name: profileName,
+          qr_code: null, // clear QR from DB once connected
+        });
+      }
+
+      // ── Disconnected ─────────────────────────────────────────────────────
+      if (connection === "close") {
+        session.lastDisconnectCode =
+          lastDisconnect?.error?.output?.statusCode ?? null;
+        session.updatedAt = nowIso();
+        console.log(`[${id}] Disconnected — code:`, session.lastDisconnectCode ?? "unknown");
+
+        if (session.lastDisconnectCode === DisconnectReason.loggedOut) {
+          session.status = "logged_out";
+          session.shouldReconnect = false;
+          session.qrDataUrl = null;
+          await updateSupabaseDevice(id, { status: "disconnected", qr_code: null });
+          return;
+        }
+
+        scheduleReconnect(session);
+      }
+    });
+
+    return session;
+  } finally {
+    // Always release the lock, whether we succeeded or threw
+    connectingNow.delete(id);
+  }
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
-// QR تصویر (از RAM می‌خونه، فوری جواب می‌ده)
+// QR image — reads from RAM, responds instantly
 app.get("/sessions/:sessionId/qr/image", (req, res) => {
   const id = sanitizeSessionId(req.params.sessionId);
   if (!id) return res.status(400).send("Invalid sessionId");
 
   const session = sessions.get(id);
-  if (!session || !session.qrDataUrl) return res.status(404).send("QR not ready");
+  if (!session || !session.qrDataUrl)
+    return res.status(404).send("QR not ready yet — try again in a moment");
 
   res.send(`<img src="${session.qrDataUrl}" alt="WhatsApp QR" />`);
 });
 
-// Connect
+// Connect endpoint
 app.post("/sessions/:sessionId/connect", async (req, res) => {
   try {
     const session = await connectSession(req.params.sessionId);
-    res.json({
-      status: true,
-      message: "Session started. Wait for QR.",
-      sessionId: session.id,
-    });
+    res.json({ status: true, message: "Session started. Wait for QR.", sessionId: session.id });
   } catch (error) {
     res.status(400).json({ status: false, message: error?.message || String(error) });
   }
 });
 
-// Send (GET برای تست مرورگر)
+// Send (GET for quick browser testing)
 app.get("/send", async (req, res) => {
   const { to, message } = req.query;
   if (!to || !message)
@@ -341,7 +349,7 @@ app.get("/send", async (req, res) => {
   }
 });
 
-// Health
+// Health check
 app.get("/health", (_req, res) => {
   const sessionList = [...sessions.values()].map((s) => ({
     id: s.id,
@@ -353,15 +361,16 @@ app.get("/health", (_req, res) => {
   res.json({ status: true, sessions: sessionList, timestamp: nowIso() });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─── Start server ─────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () =>
   console.log(`Server running at http://localhost:${PORT}`)
 );
 
-if (AUTO_START_DEFAULT)
+if (AUTO_START_DEFAULT) {
   connectSession(DEFAULT_SESSION_ID).catch((err) =>
     console.error("Default session startup failed:", err?.message || err)
   );
+}
 
 // Graceful shutdown
 async function shutdown() {
