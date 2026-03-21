@@ -16,8 +16,8 @@ const DEFAULT_SESSION_ID = process.env.DEFAULT_SESSION_ID || "default";
 // const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
 
 // Supabase
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://kbnbbbnbaukbdzehkkzz.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BJoMM';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const sessions = new Map();
