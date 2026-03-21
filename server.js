@@ -20,29 +20,19 @@ const DEFAULT_SESSION_ID = process.env.DEFAULT_SESSION_ID || "default";
 const RECONNECT_DELAY_MS = Number(process.env.RECONNECT_DELAY_MS || 5000);
 const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
 
-// ── How long to wait before saving a NEW QR to DB (ms) ──────────────────────
-// Baileys regenerates QR every ~20s. We only push to DB once per this window.
-// Set to 0 if you want every QR saved (not recommended).
+// -- How long to wait before saving a NEW QR to DB (ms) ----------------------
 const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 25_000);
 
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || "https://kbnbbbnbaukbdzehkkzz.supabase.co";
-const SUPABASE_KEY =
-  process.env.SUPABASE_KEY ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BJoMM";
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://kbnbbbnbaukbdzehkkzz.supabase.co";
+const SUPABASE_KEY = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtibmJiYm5iYXVrYmR6ZWhra3p6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA1MTgxMTQsImV4cCI6MjA4NjA5NDExNH0.wwqY_wGSM_TDDmW31GnpnV7RXMZc2YUkQagy3-BJoMM";
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── Sessions map & a Set to prevent concurrent connects ─────────────────────
 const sessions = new Map();
-const connectingNow = new Set(); // prevents double-connect race condition
+const connectingNow = new Set(); 
 
 let cachedBaileysVersion;
 
-// ─────────────────────────────────────────────────────────────────────────────
-
-function nowIso() {
-  return new Date().toISOString();
-}
+function nowIso() { return new Date().toISOString(); }
 
 function sanitizeSessionId(input) {
   if (typeof input !== "string") return null;
@@ -65,8 +55,8 @@ function getOrCreateSession(id) {
       lastError: null,
       updatedAt: nowIso(),
       authDir: null,
-      lastQrSavedAt: 0,   // timestamp of last QR push to DB
-      qrSaveCount: 0,     // debug counter
+      lastQrSavedAt: 0,
+      qrSaveCount: 0,
     });
   }
   return sessions.get(id);
@@ -92,20 +82,23 @@ function clearReconnectTimer(session) {
   session.reconnectTimer = null;
 }
 
-// ── Supabase helper ──────────────────────────────────────────────────────────
 async function updateSupabaseDevice(sessionId, data) {
   try {
     const { error } = await supabase
       .from("devices")
-      .update(data)
+      .update({ ...data, updated_date: nowIso() })
       .eq("session_data", sessionId);
-    if (error) console.error(`[DB Error ${sessionId}]`, error.message);
+    if (error) {
+      console.error(`[DB Error ${sessionId}]`, error.message);
+    } else {
+      const type = data.qr_code ? "QR" : (data.status || "Status");
+      console.log(`[DB Success ${sessionId}] Updated ${type}`);
+    }
   } catch (err) {
     console.error(`[DB Exception ${sessionId}]`, err);
   }
 }
 
-// ── Close session ────────────────────────────────────────────────────────────
 async function closeSession(session, { logout = false, removeAuth = false } = {}) {
   session.shouldReconnect = false;
   clearReconnectTimer(session);
@@ -127,15 +120,12 @@ async function closeSession(session, { logout = false, removeAuth = false } = {}
   }
 }
 
-// ── Schedule reconnect ───────────────────────────────────────────────────────
 function scheduleReconnect(session) {
   if (!session.shouldReconnect) return;
   clearReconnectTimer(session);
   session.status = "reconnecting";
   session.reconnectAttempts += 1;
   session.updatedAt = nowIso();
-
-  // Reset throttle so first QR after reconnect saves immediately
   session.lastQrSavedAt = 0;
 
   session.reconnectTimer = setTimeout(() => {
@@ -148,11 +138,7 @@ function scheduleReconnect(session) {
   }, RECONNECT_DELAY_MS);
 }
 
-// ── QR handler with throttle ─────────────────────────────────────────────────
-// Always stores QR in RAM for the /qr/image endpoint.
-// Only pushes to Supabase DB at most once per QR_THROTTLE_MS window.
 async function handleQR(session, qr) {
-  // 1. Generate data URL (always, so /qr/image always has latest)
   let dataUrl;
   try {
     dataUrl = await QRCode.toDataURL(qr);
@@ -167,24 +153,17 @@ async function handleQR(session, qr) {
   session.status = "qr_ready";
   session.updatedAt = nowIso();
 
-  // 2. Throttle DB writes
   const now = Date.now();
   const elapsed = now - session.lastQrSavedAt;
 
   if (elapsed < QR_THROTTLE_MS) {
-    // QR is fresh in RAM but we skip the DB write this time
-    console.log(
-      `[${session.id}] QR generated — DB write skipped (throttled, ${Math.round(elapsed / 1000)}s elapsed of ${QR_THROTTLE_MS / 1000}s window)`
-    );
+    console.log(`[${session.id}] QR cached, skipping DB write (throttle)`);
     return;
   }
 
-  // 3. Save to DB
   session.lastQrSavedAt = now;
   session.qrSaveCount += 1;
-  console.log(
-    `[${session.id}] QR #${session.qrSaveCount} saved to DB`
-  );
+  console.log(`[${session.id}] QR #${session.qrSaveCount} saved to DB`);
 
   await updateSupabaseDevice(session.id, {
     qr_code: dataUrl,
@@ -192,28 +171,37 @@ async function handleQR(session, qr) {
   });
 }
 
-// ── Main connect function ────────────────────────────────────────────────────
-async function connectSession(sessionId) {
+async function connectSession(sessionId, force = false) {
   const id = sanitizeSessionId(sessionId);
-  if (!id) throw new Error("Invalid sessionId. Use 2-64 chars: a-z, 0-9, _ or -");
+  if (!id) throw new Error("Invalid sessionId");
 
-  // ── GUARD: prevent two simultaneous connects for the same session ─────────
   if (connectingNow.has(id)) {
-    console.warn(`[${id}] connectSession called while already connecting — ignored`);
+    console.warn(`[${id}] Already connecting...`);
     return getOrCreateSession(id);
   }
+  
+  const session = getOrCreateSession(id);
+
+  // Avoid unnecessary restarts if already active or recently attempted
+  if (!force && (session.status === "connected" || session.status === "connecting" || session.status === "qr_ready")) {
+    const elapsed = Date.now() - new Date(session.updatedAt).getTime();
+    if (elapsed < 30000) {
+      console.log(`[${id}] Session already ${session.status}, skipping.`);
+      return session;
+    }
+  }
+
   connectingNow.add(id);
 
   try {
-    const session = getOrCreateSession(id);
     session.shouldReconnect = true;
     session.lastError = null;
-    session.lastQrSavedAt = 0; // reset throttle on fresh connect
+    session.lastQrSavedAt = 0;
     session.updatedAt = nowIso();
     clearReconnectTimer(session);
 
-    // Tear down any existing socket cleanly
     if (session.sock) {
+      console.log(`[${id}] Restarting socket...`);
       try { session.sock.end(new Error("Restarting session")); } catch {}
       session.sock = null;
     }
@@ -244,17 +232,11 @@ async function connectSession(sessionId) {
     });
 
     sock.ev.on("connection.update", async (update) => {
-      // Stale socket check — ignore events from old sockets
       if (session.sock !== sock) return;
-
       const { connection, qr, lastDisconnect } = update;
 
-      // ── QR received ──────────────────────────────────────────────────────
-      if (qr) {
-        await handleQR(session, qr);
-      }
+      if (qr) await handleQR(session, qr);
 
-      // ── Connected ────────────────────────────────────────────────────────
       if (connection === "open") {
         session.status = "connected";
         session.qrDataUrl = null;
@@ -263,30 +245,23 @@ async function connectSession(sessionId) {
         session.lastError = null;
         session.lastQrSavedAt = 0;
         session.updatedAt = nowIso();
-        console.log(`[${id}] WhatsApp connected`);
+        console.log(`[${id}] Connected`);
 
-        const user = sock.user;
-        const phoneNumber =
-          user?.id?.split(":")?.[1]?.split("@")?.[0] ||
-          user?.id?.split(":")?.[0] ||
-          null;
-        const profileName =
-          user?.name || user?.verifiedName || phoneNumber || "WhatsApp Device";
+        const phoneNumber = sock.user?.id?.split(":")[0]?.split("@")[0] || null;
+        const profileName = sock.user?.name || sock.user?.verifiedName || phoneNumber || "WhatsApp Device";
 
         await updateSupabaseDevice(id, {
           status: "connected",
           phone_number: phoneNumber,
           name: profileName,
-          qr_code: null, // clear QR from DB once connected
+          qr_code: null,
         });
       }
 
-      // ── Disconnected ─────────────────────────────────────────────────────
       if (connection === "close") {
-        session.lastDisconnectCode =
-          lastDisconnect?.error?.output?.statusCode ?? null;
+        session.lastDisconnectCode = lastDisconnect?.error?.output?.statusCode ?? null;
         session.updatedAt = nowIso();
-        console.log(`[${id}] Disconnected — code:`, session.lastDisconnectCode ?? "unknown");
+        console.log(`[${id}] Disconnected:`, session.lastDisconnectCode);
 
         if (session.lastDisconnectCode === DisconnectReason.loggedOut) {
           session.status = "logged_out";
@@ -295,89 +270,117 @@ async function connectSession(sessionId) {
           await updateSupabaseDevice(id, { status: "disconnected", qr_code: null });
           return;
         }
-
         scheduleReconnect(session);
       }
     });
 
     return session;
   } finally {
-    // Always release the lock, whether we succeeded or threw
     connectingNow.delete(id);
   }
 }
 
-// ─── Routes ──────────────────────────────────────────────────────────────────
-
-// QR image — reads from RAM, responds instantly
 app.get("/sessions/:sessionId/qr/image", (req, res) => {
   const id = sanitizeSessionId(req.params.sessionId);
-  if (!id) return res.status(400).send("Invalid sessionId");
-
+  if (!id) return res.status(400).send("Invalid ID");
   const session = sessions.get(id);
-  if (!session || !session.qrDataUrl)
-    return res.status(404).send("QR not ready yet — try again in a moment");
+  if (!session || !session.qrDataUrl) return res.status(404).send("QR not ready");
 
-  res.send(`<img src="${session.qrDataUrl}" alt="WhatsApp QR" />`);
-});
-
-// Connect endpoint
-app.post("/sessions/:sessionId/connect", async (req, res) => {
   try {
-    const session = await connectSession(req.params.sessionId);
-    res.json({ status: true, message: "Session started. Wait for QR.", sessionId: session.id });
-  } catch (error) {
-    res.status(400).json({ status: false, message: error?.message || String(error) });
+    const base64Data = session.qrDataUrl.replace(/^data:image\/\w+;base64,/, "");
+    const img = Buffer.from(base64Data, "base64");
+    res.writeHead(200, {
+      "Content-Type": "image/png",
+      "Content-Length": img.length,
+      "Cache-Control": "no-store",
+    });
+    res.end(img);
+  } catch (err) {
+    res.status(500).send("Error");
   }
 });
 
-// Send (GET for quick browser testing)
-app.get("/send", async (req, res) => {
-  const { to, message } = req.query;
-  if (!to || !message)
-    return res.json({ status: false, message: "to or message missing" });
+app.post("/sessions/:sessionId/connect", async (req, res) => {
+  try {
+    const session = await connectSession(req.params.sessionId);
+    res.json({ status: true, sessionId: session.id });
+  } catch (error) {
+    res.status(400).json({ status: false, message: error.message });
+  }
+});
+
+app.get("/sessions/:sessionId/status", (req, res) => {
+  const id = sanitizeSessionId(req.params.sessionId);
+  if (!id) return res.status(400).json({ status: "disconnected", connected: false });
+  const session = sessions.get(id);
+  if (!session) return res.status(404).json({ status: "disconnected", connected: false });
+  
+  res.json({
+    status: session.status,
+    connected: session.status === "connected",
+    qr: session.qrDataUrl ? true : false,
+    updatedAt: session.updatedAt
+  });
+});
+
+app.post("/sessions/:sessionId/send", async (req, res) => {
+  const id = sanitizeSessionId(req.params.sessionId);
+  if (!id) return res.status(400).json({ error: "Invalid ID" });
+  
+  const { to, text, mediaUrl, caption } = req.body;
+  if (!to || (!text && !mediaUrl)) {
+    return res.status(400).json({ error: "Missing to or message" });
+  }
+
+  const session = sessions.get(id);
+  if (!session || session.status !== "connected" || !session.sock) {
+    return res.status(400).json({ error: "Device not connected" });
+  }
 
   try {
-    const session = sessions.get(DEFAULT_SESSION_ID);
-    if (!session || session.status !== "connected")
-      return res.json({ status: false, message: "WhatsApp not connected yet" });
+    // Ensure the number is just digits
+    const cleanTo = to.replace(/\D/g, "");
+    const jid = cleanTo + "@s.whatsapp.net";
+    
+    if (mediaUrl) {
+       await session.sock.sendMessage(jid, { image: { url: mediaUrl }, caption: caption || text || "" });
+    } else {
+       await session.sock.sendMessage(jid, { text });
+    }
+    res.json({ success: true, status: "sent" });
+  } catch (err) {
+    console.error(`[Send Error ${id}]`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
+app.get("/send", async (req, res) => {
+  const { to, message, sessionId } = req.query;
+  const targetId = sessionId ? sanitizeSessionId(sessionId) : DEFAULT_SESSION_ID;
+  if (!to || !message || !targetId) return res.json({ status: false, message: "Missing required fields" });
+  try {
+    const session = sessions.get(targetId);
+    if (!session || session.status !== "connected" || !session.sock) {
+        return res.json({ status: false, message: "Device not connected" });
+    }
     await session.sock.sendMessage(to + "@s.whatsapp.net", { text: message });
-    res.json({ status: true, message: "Sent successfully" });
+    res.json({ status: true });
   } catch (err) {
     res.json({ status: false, message: err.message });
   }
 });
 
-// Health check
 app.get("/health", (_req, res) => {
-  const sessionList = [...sessions.values()].map((s) => ({
-    id: s.id,
-    status: s.status,
-    qrSaveCount: s.qrSaveCount,
-    reconnectAttempts: s.reconnectAttempts,
-    updatedAt: s.updatedAt,
-  }));
-  res.json({ status: true, sessions: sessionList, timestamp: nowIso() });
+  res.json({ status: true, sessions: [...sessions.values()].map(s => ({ id: s.id, status: s.status })) });
 });
 
-// ─── Start server ─────────────────────────────────────────────────────────────
-const server = app.listen(PORT, () =>
-  console.log(`Server running at http://localhost:${PORT}`)
-);
+const server = app.listen(PORT, () => console.log(`Running on ${PORT}`));
 
-if (AUTO_START_DEFAULT) {
-  connectSession(DEFAULT_SESSION_ID).catch((err) =>
-    console.error("Default session startup failed:", err?.message || err)
-  );
-}
+if (AUTO_START_DEFAULT) connectSession(DEFAULT_SESSION_ID).catch(err => console.error(err));
 
-// Graceful shutdown
 async function shutdown() {
-  for (const session of sessions.values())
-    await closeSession(session, { logout: false, removeAuth: false });
+  for (const session of sessions.values()) await closeSession(session);
   server.close(() => process.exit(0));
 }
-
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
