@@ -114,25 +114,44 @@ async function updateSupabaseDevice(sessionId, data) {
   try {
     const { error } = await supabase
       .from('devices')
-      .update(data)
-      .eq('session_data', sessionId); // اصلاح شد: جستجو بر اساس session_data
-    if (error) console.error(`[DB Error ${sessionId}]`, error.message);
+      .update({ ...data, updated_date: nowIso() })
+      .eq('session_data', sessionId); 
+    
+    if (error) {
+      console.error(`[DB Error ${sessionId}]`, error.message);
+    } else {
+      const type = data.qr_code ? "QR" : (data.status || "Status");
+      console.log(`[DB Success ${sessionId}] Updated ${type}`);
+    }
   } catch (err) {
     console.error(`[DB Exception ${sessionId}]`, err);
   }
 }
 
-async function connectSession(sessionId) {
+async function connectSession(sessionId, force = false) {
   const id = sanitizeSessionId(sessionId);
   if (!id) throw new Error("Invalid sessionId. Use 2-64 chars: a-z, 0-9, _ or -");
 
   const session = getOrCreateSession(id);
+  
+  // جلوگیری از اتصال مجدد اگر در حال حاضر متصل یا در حال اتصال است
+  if (!force && (session.status === "connected" || session.status === "connecting" || session.status === "qr_ready")) {
+    const elapsed = Date.now() - new Date(session.updatedAt).getTime();
+    if (elapsed < 30000) { // اگر کمتر از ۳۰ ثانیه از آخرین وضعیت گذشته باشد، تلاش مجدد نمی‌کنیم
+      console.log(`[${id}] Session already active (${session.status}), skipping connect`);
+      return session;
+    }
+  }
+
   session.shouldReconnect = true;
   session.lastError = null;
   session.updatedAt = nowIso();
   clearReconnectTimer(session);
 
-  if (session.sock) try { session.sock.end(new Error("Restarting session")); } catch {}
+  if (session.sock) {
+    console.log(`[${id}] Ending previous socket to restart...`);
+    try { session.sock.end(new Error("Restarting session")); } catch {}
+  }
   session.sock = null;
 
   const authDir = await resolveAuthDir(id);
@@ -235,7 +254,19 @@ app.get("/sessions/:sessionId/qr/image", (req, res) => {
   const session = sessions.get(id);
   if (!session || !session.qrDataUrl) return res.status(404).send("QR not ready");
 
-  res.send(`<img src="${session.qrDataUrl}" alt="WhatsApp QR" />`);
+  // اصلاح شد: ارسال مستقیم داده‌های تصویر به جای تگ HTML
+  try {
+    const base64Data = session.qrDataUrl.replace(/^data:image\/\w+;base64,/, "");
+    const img = Buffer.from(base64Data, 'base64');
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': img.length,
+      'Cache-Control': 'no-store'
+    });
+    res.end(img);
+  } catch (err) {
+    res.status(500).send("Error converting QR to image");
+  }
 });
 
 // Endpoint connect
