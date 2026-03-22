@@ -231,6 +231,53 @@ async function connectSession(sessionId, force = false) {
       if (session.sock === sock) saveCreds(...args);
     });
 
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (session.sock !== sock) return;
+      if (type !== 'notify') return;
+
+      const webhookUrl = process.env.WEBHOOK_URL || "https://whatsapp-panel-87d2d.web.app/api/webhooks/whatsapp/incoming";
+      const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET || "";
+
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        if (msg.key.fromMe) continue;
+        
+        const isGroup = msg.key.remoteJid?.endsWith('@g.us');
+        
+        let text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+        let messageType = "text";
+        if (msg.message.imageMessage) {
+            messageType = "image";
+            text = msg.message.imageMessage.caption || text;
+        } else if (msg.message.documentMessage) messageType = "document";
+        else if (msg.message.audioMessage) messageType = "audio";
+        else if (msg.message.videoMessage) messageType = "video";
+        
+        const phone = msg.key.remoteJid.split('@')[0];
+
+        const payload = {
+            sessionId: id,
+            from: phone,
+            text,
+            message_type: messageType,
+            is_group: isGroup
+        };
+
+        try {
+            await fetch(webhookUrl, {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json', 
+                    'x-webhook-secret': webhookSecret 
+                },
+                body: JSON.stringify(payload)
+            });
+        } catch (err) {
+            console.error(`[Webhook Error ${id}]`, err.message);
+        }
+      }
+    });
+
     sock.ev.on("connection.update", async (update) => {
       if (session.sock !== sock) return;
       const { connection, qr, lastDisconnect } = update;
