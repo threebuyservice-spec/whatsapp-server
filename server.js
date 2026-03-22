@@ -235,7 +235,7 @@ async function connectSession(sessionId, force = false) {
       if (session.sock !== sock) return;
       if (type !== 'notify') return;
 
-      const webhookUrl = process.env.WEBHOOK_URL || "https://whatsapp-panel-87d2d.web.app/api/webhooks/whatsapp/incoming";
+      const webhookUrl = process.env.WEBHOOK_URL || "https://whatsapp-panel-production.up.railway.app/api/webhooks/whatsapp/incoming";
       const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET || "";
 
       for (const msg of messages) {
