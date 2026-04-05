@@ -1,0 +1,811 @@
+import * as dotenv from "dotenv";
+dotenv.config();
+
+import express from "express";
+import fs from "fs/promises";
+import path from "path";
+import QRCode from "qrcode";
+import { createClient } from "@supabase/supabase-js";
+import makeWASocket, {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  Browsers,
+  DisconnectReason,
+} from "@whiskeysockets/baileys";
+import { useSupabaseAuthState } from "./lib/useSupabaseAuthState.mjs";
+import { logger, childLogger, createBaileysLogger } from "./lib/logger.mjs";
+import { createQueue, redisConnection } from "./lib/queues.mjs";
+import { initLeaderElection, currentIsLeader } from "./lib/leader.mjs";
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+const PORT = Number(process.env.PORT || 3000);
+const AUTH_ROOT = path.resolve(process.env.AUTH_ROOT || "auth_info");
+const DEFAULT_SESSION_ID = sanitizeSessionId(process.env.DEFAULT_SESSION_ID || "default") || "default";
+const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
+
+const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 3000);
+const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
+const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 15_000);
+
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "";
+
+const AUTH_MODE = (process.env.AUTH_MODE || "").toLowerCase();
+
+const supabase =
+  SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+
+/** Persist Baileys creds in whatsapp_baileys_auth (recommended on Railway). */
+const useSupabaseAuth =
+  AUTH_MODE === "supabase" ||
+  (AUTH_MODE !== "filesystem" && Boolean(supabase));
+
+if (AUTH_MODE === "supabase" && !supabase) {
+  logger.fatal(
+    "AUTH_MODE=supabase requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)"
+  );
+  process.exit(1);
+}
+
+if (!useSupabaseAuth) {
+  logger.warn(
+    { AUTH_MODE: AUTH_MODE || "auto" },
+    "auth_filesystem_ephemeral_on_railway_use_supabase_or_AUTH_MODE=supabase"
+  );
+}
+
+const WEBHOOK_URL =
+  process.env.WHATSAPP_WEBHOOK_URL ||
+  process.env.WEBHOOK_URL ||
+  "";
+const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || "";
+const API_SECRET = process.env.API_SECRET || "";
+const ENABLE_EVENT_WRAPPER = process.env.ENABLE_EVENT_WRAPPER === "true";
+
+const sessions = new Map();
+const connectingNow = new Set();
+
+
+let cachedBaileysVersion;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function sanitizeSessionId(input) {
+  if (typeof input !== "string") return null;
+  const id = input.trim().toLowerCase();
+  if (!/^[a-z0-9_-]{2,64}$/.test(id)) return null;
+  return id;
+}
+
+function isUuid(s) {
+  return (
+    typeof s === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)
+  );
+}
+
+function getOrCreateSession(id) {
+  if (!sessions.has(id)) {
+    sessions.set(id, {
+      id,
+      log: childLogger(id),
+      sock: null,
+      status: "idle",
+      qrDataUrl: null,
+      reconnectAttempts: 0,
+      reconnectTimer: null,
+      shouldReconnect: true,
+      lastDisconnectCode: null,
+      lastError: null,
+      updatedAt: nowIso(),
+      authDir: null,
+      lastQrSavedAt: 0,
+      qrSaveCount: 0,
+      /** @type {string | null} */
+      panelDeviceId: null,
+      /** bound socket for messages.upsert */
+      boundSock: null,
+    });
+  }
+  return sessions.get(id);
+}
+
+async function resolveAuthDir(sessionId) {
+  return path.join(AUTH_ROOT, sessionId);
+}
+
+async function getBaileysVersion() {
+  if (cachedBaileysVersion) return cachedBaileysVersion;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedBaileysVersion = version;
+    return version;
+  } catch (e) {
+    logger.warn({ err: String(e) }, "fetchLatestBaileysVersion_failed");
+    return undefined;
+  }
+}
+
+function clearReconnectTimer(session) {
+  if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+  session.reconnectTimer = null;
+}
+
+async function updateSupabaseDevice(sessionId, data) {
+  if (!supabase) return;
+  const session = sessions.get(sessionId);
+  try {
+    let query = supabase.from("devices").update({ ...data, updated_date: nowIso() });
+    if (isUuid(sessionId)) {
+      query = query.eq("id", sessionId);
+    } else {
+      query = query.eq("session_data", sessionId);
+    }
+    const { error } = await query;
+    if (error) {
+      session?.log?.warn({ msg: error.message }, "devices_db_update_error");
+    } else {
+      session?.log?.info(
+        { kind: data.qr_code ? "qr" : data.status || "status" },
+        "devices_db_updated"
+      );
+    }
+  } catch (err) {
+    const session = sessions.get(sessionId);
+    session?.log?.warn({ err: String(err) }, "devices_db_update_exception");
+  }
+}
+
+/** Resolve panel devices.id for webhook (matches session_data = session id). */
+async function resolvePanelDeviceId(session) {
+  if (session.panelDeviceId && isUuid(session.panelDeviceId)) return session.panelDeviceId;
+  if (isUuid(session.id)) {
+    session.panelDeviceId = session.id;
+    return session.id;
+  }
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from("devices")
+      .select("id")
+      .eq("session_data", session.id)
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      session.log.warn({ msg: error.message }, "resolve_device_id_error");
+      return null;
+    }
+    if (data?.id) {
+      session.panelDeviceId = data.id;
+      session.log = session.log.child({ device_id: data.id });
+      session.log.info({ deviceId: data.id }, "device_id_resolved");
+      return data.id;
+    }
+  } catch (e) {
+    session.log.warn({ err: String(e) }, "resolve_device_id_exception");
+  }
+  return null;
+}
+
+function requireApiAuth(req, res, next) {
+  if (!API_SECRET) return next();
+  const authHeader = req.headers.authorization || "";
+  if (authHeader !== `Bearer ${API_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+const webhookQueue = createQueue("webhooks", async (jobData) => {
+  const { sessionId, body } = jobData;
+  const session = sessions.get(sessionId) || { log: logger.child({ sessionId }) };
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+  const res = await fetch(WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-webhook-secret": WEBHOOK_SECRET,
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  });
+
+  clearTimeout(timeoutId);
+
+  if (!res.ok) {
+    throw new Error(`HTTP error! status: ${res.status}`);
+  }
+
+  session.log.debug({ status: res.status }, "webhook_ok");
+});
+
+// Pause locally until we are elected leader if Redis is active
+if (webhookQueue.worker && redisConnection) {
+  webhookQueue.worker.pause();
+}
+
+async function postWebhook(session, structuredPayload) {
+  if (!WEBHOOK_URL) {
+    session.log.warn("WHATSAPP_WEBHOOK_URL not set; skipping webhook");
+    return;
+  }
+  
+  const deviceId = await resolvePanelDeviceId(session);
+  
+  let finalBody = {};
+  
+  if (structuredPayload.type === "message" && !ENABLE_EVENT_WRAPPER) {
+    // Keep legacy flat structure for messages, to not break BFF
+    finalBody = {
+      ...structuredPayload.payload,
+      sessionId: session.id,
+      ...(deviceId ? { device_id: deviceId } : {}),
+    };
+  } else {
+    // Safe wrapped mode or connection event
+    finalBody = {
+      type: structuredPayload.type,
+      device_id: deviceId || session.id,
+      sessionId: session.id,
+      event: structuredPayload.event,
+      payload: structuredPayload.payload,
+      timestamp: Date.now()
+    };
+  }
+
+  webhookQueue.add("webhook", { sessionId: session.id, body: finalBody }, { attempts: 5 });
+}
+
+async function postIncomingWebhook(session, payload) {
+  await postWebhook(session, {
+    type: "message",
+    payload
+  });
+}
+
+/**
+ * Register messages.upsert once per live socket so reconnect gets a fresh listener.
+ */
+function bindMessagesUpsert(session, sock) {
+  const handler = async ({ messages, type }) => {
+    if (session.sock !== sock) {
+      session.log.debug({ type }, "messages.upsert_ignored_stale_socket");
+      return;
+    }
+    if (type !== "notify") return;
+
+    session.log.info({ count: messages?.length || 0, type }, "messages.upsert");
+
+    for (const msg of messages) {
+      if (!msg.message) continue;
+      if (msg.key.fromMe) continue;
+
+      const isGroup = msg.key.remoteJid?.endsWith("@g.us");
+      let text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+      let messageType = "text";
+      if (msg.message.imageMessage) {
+        messageType = "image";
+        text = msg.message.imageMessage.caption || text;
+      } else if (msg.message.documentMessage) messageType = "document";
+      else if (msg.message.audioMessage) messageType = "audio";
+      else if (msg.message.videoMessage) messageType = "video";
+
+      const phone = msg.key.remoteJid.split("@")[0];
+
+      await postIncomingWebhook(session, {
+        from: phone,
+        text,
+        message_type: messageType,
+        is_group: isGroup,
+      });
+    }
+  };
+
+  sock.ev.on("messages.upsert", handler);
+  session.boundSock = sock;
+  session.log.info("messages.upsert_listener_bound");
+}
+
+async function closeSession(session, { logout = false, removeAuth = false } = {}) {
+  session.shouldReconnect = false;
+  clearReconnectTimer(session);
+
+  if (session.sock) {
+    try {
+      if (logout) await session.sock.logout();
+    } catch {}
+    try {
+      if (session.sock.end) session.sock.end(new Error("Session closed"));
+    } catch {}
+  }
+
+  session.sock = null;
+  session.boundSock = null;
+  session.qrDataUrl = null;
+  session.status = "closed";
+  session.updatedAt = nowIso();
+
+  await updateSupabaseDevice(session.id, { status: "disconnected", qr_code: null });
+
+  if (removeAuth && session.authDir) {
+    await fs.rm(session.authDir, { recursive: true, force: true });
+  }
+}
+
+function reconnectDelayMs(session) {
+  const exp = Math.min(
+    RECONNECT_MAX_MS,
+    RECONNECT_BASE_MS * Math.pow(2, Math.min(session.reconnectAttempts, 8))
+  );
+  const jitter = Math.floor(Math.random() * 800);
+  return exp + jitter;
+}
+
+function scheduleReconnect(session) {
+  if (!session.shouldReconnect) return;
+  clearReconnectTimer(session);
+  session.status = "reconnecting";
+  session.reconnectAttempts += 1;
+  session.updatedAt = nowIso();
+  session.lastQrSavedAt = 0;
+
+  const delay = reconnectDelayMs(session);
+  session.log.info({ delayMs: delay, attempt: session.reconnectAttempts }, "reconnect_scheduled");
+
+  session.reconnectTimer = setTimeout(() => {
+    connectSession(session.id, {}).catch((err) => {
+      session.status = "error";
+      session.lastError = err?.message || String(err);
+      session.updatedAt = nowIso();
+      session.log.error({ err: session.lastError }, "reconnect_connect_failed");
+      scheduleReconnect(session);
+    });
+  }, delay);
+}
+
+async function handleQR(session, qr) {
+  let dataUrl;
+  try {
+    dataUrl = await QRCode.toDataURL(qr);
+  } catch (err) {
+    session.status = "error";
+    session.lastError = err?.message || String(err);
+    session.updatedAt = nowIso();
+    session.log.error({ err: session.lastError }, "qr_encode_failed");
+    return;
+  }
+
+  session.qrDataUrl = dataUrl;
+  session.status = "qr_ready";
+  session.updatedAt = nowIso();
+
+  const now = Date.now();
+  const elapsed = now - session.lastQrSavedAt;
+
+  if (elapsed < QR_THROTTLE_MS) {
+    session.log.debug("qr_throttled_skip_db");
+    return;
+  }
+
+  session.lastQrSavedAt = now;
+  session.qrSaveCount += 1;
+  session.log.info({ n: session.qrSaveCount }, "qr_saved_db");
+
+  await updateSupabaseDevice(session.id, {
+    qr_code: dataUrl,
+    status: "scanning",
+  });
+
+  await postWebhook(session, {
+    type: "connection",
+    event: "qr",
+    payload: { status: "scanning", qr_code: dataUrl }
+  });
+}
+
+/**
+ * @param {string} sessionId
+ * @param {{ force?: boolean, panelDeviceId?: string | null }} opts
+ */
+async function connectSession(sessionId, opts = {}) {
+  const force = Boolean(opts.force);
+  const id = sanitizeSessionId(sessionId);
+  if (!id) throw new Error("Invalid sessionId");
+
+  if (opts.panelDeviceId && isUuid(opts.panelDeviceId)) {
+    const s = getOrCreateSession(id);
+    s.panelDeviceId = opts.panelDeviceId;
+    s.log = s.log.child({ device_id: opts.panelDeviceId });
+    s.log.info({ deviceId: opts.panelDeviceId }, "device_id_from_connect_body");
+  }
+
+  if (connectingNow.has(id)) {
+    logger.warn({ id }, "connect_skip_already_connecting");
+    return getOrCreateSession(id);
+  }
+
+  const session = getOrCreateSession(id);
+
+  if (
+    !force &&
+    (session.status === "connected" || session.status === "connecting" || session.status === "qr_ready")
+  ) {
+    const elapsed = Date.now() - new Date(session.updatedAt).getTime();
+    if (elapsed < 30_000) {
+      session.log.info({ status: session.status }, "connect_skip_recent_state");
+      return session;
+    }
+  }
+
+  connectingNow.add(id);
+
+  try {
+    session.shouldReconnect = true;
+    session.lastError = null;
+    session.lastQrSavedAt = 0;
+    session.updatedAt = nowIso();
+    clearReconnectTimer(session);
+
+    if (session.sock) {
+      session.log.info("ending_previous_socket");
+      try {
+        session.sock.end(new Error("Restarting session"));
+      } catch {}
+      session.sock = null;
+    }
+
+    const authDir = await resolveAuthDir(id);
+    session.authDir = authDir;
+
+    let state;
+    let saveCreds;
+
+    if (useSupabaseAuth && supabase) {
+      session.log.info("auth_state_supabase");
+      const auth = await useSupabaseAuthState(supabase, id, {
+        debug: process.env.AUTH_DEBUG === "true",
+        log: (msg, extra) => session.log.debug({ ...extra, msg }, "auth_kv"),
+      });
+      state = auth.state;
+      saveCreds = auth.saveCreds;
+    } else {
+      session.log.info({ authDir }, "auth_state_filesystem");
+      await fs.mkdir(authDir, { recursive: true });
+      const auth = await useMultiFileAuthState(authDir);
+      state = auth.state;
+      saveCreds = auth.saveCreds;
+    }
+
+    const version = await getBaileysVersion();
+
+    const sock = makeWASocket({
+      auth: state,
+      browser: Browsers.macOS("Desktop"),
+      version,
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+      shouldSyncHistoryMessage: () => false,
+      markOnlineOnConnect: true,
+      logger: createBaileysLogger(),
+    });
+
+    session.sock = sock;
+    session.status = "connecting";
+    session.qrDataUrl = null;
+    session.updatedAt = nowIso();
+
+    sock.ev.on("creds.update", () => {
+      if (session.sock === sock) saveCreds();
+    });
+
+    bindMessagesUpsert(session, sock);
+
+    sock.ev.on("connection.update", async (update) => {
+      if (session.sock !== sock) return;
+      const { connection, qr, lastDisconnect } = update;
+
+      if (qr) await handleQR(session, qr);
+
+      if (connection === "open") {
+        session.status = "connected";
+        session.qrDataUrl = null;
+        session.reconnectAttempts = 0;
+        session.lastDisconnectCode = null;
+        session.lastError = null;
+        session.lastQrSavedAt = 0;
+        session.updatedAt = nowIso();
+        session.log.info("connection_open");
+
+        await resolvePanelDeviceId(session);
+
+        const phoneNumber = sock.user?.id?.split(":")[0]?.split("@")[0] || null;
+        const profileName = sock.user?.name || sock.user?.verifiedName || phoneNumber || "WhatsApp Device";
+
+        await updateSupabaseDevice(id, {
+          status: "connected",
+          phone_number: phoneNumber,
+          name: profileName,
+          qr_code: null,
+        });
+
+        await postWebhook(session, {
+          type: "connection",
+          event: "connected",
+          payload: { phone_number: phoneNumber, name: profileName }
+        });
+      }
+
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode ?? null;
+        session.lastDisconnectCode = statusCode;
+        session.updatedAt = nowIso();
+        session.sock = null;
+
+        session.log.warn(
+          { statusCode, reason: lastDisconnect?.error?.message },
+          "connection_close"
+        );
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          session.status = "logged_out";
+          session.shouldReconnect = false;
+          session.qrDataUrl = null;
+          await updateSupabaseDevice(id, { status: "disconnected", qr_code: null });
+          postWebhook(session, { type: "connection", event: "disconnected", payload: { reason: "logged_out" } });
+          return;
+        }
+
+        postWebhook(session, { type: "connection", event: "error", payload: { statusCode, reason: lastDisconnect?.error?.message } });
+        scheduleReconnect(session);
+      }
+    });
+
+    return session;
+  } finally {
+    connectingNow.delete(id);
+  }
+}
+
+app.get("/", (_req, res) => {
+  res.json({
+    service: "whatsapp-server",
+    baileys: true,
+    health: "/health",
+    auth: useSupabaseAuth ? "supabase" : "filesystem",
+    docs: "Use POST /sessions/:sessionId/connect and GET /sessions/:sessionId/status",
+  });
+});
+
+app.get("/internal/metrics/webhooks", requireApiAuth, async (req, res) => {
+  try {
+    const data = await webhookQueue.getMetrics();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/sessions/:sessionId/qr/image", requireApiAuth, (req, res) => {
+  const id = sanitizeSessionId(req.params.sessionId);
+  if (!id) return res.status(400).send("Invalid ID");
+  const session = sessions.get(id);
+  if (!session || !session.qrDataUrl) return res.status(404).send("QR not ready");
+
+  try {
+    const base64Data = session.qrDataUrl.replace(/^data:image\/\w+;base64,/, "");
+    const img = Buffer.from(base64Data, "base64");
+    res.writeHead(200, {
+      "Content-Type": "image/png",
+      "Content-Length": img.length,
+      "Cache-Control": "no-store",
+    });
+    res.end(img);
+  } catch {
+    res.status(500).send("Error");
+  }
+});
+
+app.post("/sessions/:sessionId/connect", requireApiAuth, async (req, res) => {
+  try {
+    const bodyDeviceId = req.body?.device_id;
+    const panelDeviceId = isUuid(bodyDeviceId) ? bodyDeviceId : null;
+    const session = await connectSession(req.params.sessionId, {
+      force: Boolean(req.body?.force),
+      panelDeviceId,
+    });
+    res.json({
+      status: true,
+      sessionId: session.id,
+      panelDeviceId: session.panelDeviceId || null,
+      auth: useSupabaseAuth ? "supabase" : "filesystem",
+    });
+  } catch (error) {
+    res.status(400).json({ status: false, message: error.message });
+  }
+});
+
+app.post("/sessions/:sessionId/disconnect", requireApiAuth, async (req, res) => {
+  const id = sanitizeSessionId(req.params.sessionId);
+  if (!id) return res.status(400).json({ error: "Invalid ID" });
+  const session = sessions.get(id);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+
+  try {
+    const logout = Boolean(req.body?.logout);
+    const removeAuth = Boolean(req.body?.removeAuth);
+    await closeSession(session, { logout, removeAuth });
+    res.json({ success: true, status: "disconnected" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/sessions/:sessionId/status", requireApiAuth, (req, res) => {
+  const id = sanitizeSessionId(req.params.sessionId);
+  if (!id) return res.status(400).json({ status: "disconnected", connected: false });
+  const session = sessions.get(id);
+  if (!session) return res.status(404).json({ status: "disconnected", connected: false });
+
+  res.json({
+    status: session.status,
+    connected: session.status === "connected",
+    qr: Boolean(session.qrDataUrl),
+    updatedAt: session.updatedAt,
+    panelDeviceId: session.panelDeviceId || null,
+    reconnectAttempts: session.reconnectAttempts,
+  });
+});
+
+app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
+  const id = sanitizeSessionId(req.params.sessionId);
+  if (!id) return res.status(400).json({ error: "Invalid ID" });
+
+  const { to, text, mediaUrl, caption } = req.body;
+  if (!to || (!text && !mediaUrl)) {
+    return res.status(400).json({ error: "Missing to or message" });
+  }
+
+  const session = sessions.get(id);
+  if (!session || session.status !== "connected" || !session.sock) {
+    return res.status(400).json({ error: "Device not connected" });
+  }
+
+  try {
+    const cleanTo = String(to).replace(/\D/g, "");
+    const jid = `${cleanTo}@s.whatsapp.net`;
+
+    if (!session.sendQueue) session.sendQueue = Promise.resolve();
+
+    const doSend = async () => {
+      if (mediaUrl) {
+        await session.sock.sendMessage(jid, {
+          image: { url: mediaUrl },
+          caption: caption || text || "",
+        });
+      } else {
+        await session.sock.sendMessage(jid, { text });
+      }
+    };
+
+    session.sendQueue = session.sendQueue
+      .then(() => new Promise((resolve) => setTimeout(resolve, 1000))) // 1s rate limit
+      .then(doSend);
+
+    await session.sendQueue;
+
+    session.log.info({ to: cleanTo }, "send_ok");
+    res.json({ success: true, status: "sent" });
+  } catch (err) {
+    session.log.error({ err: err?.message }, "send_error");
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/send", requireApiAuth, async (req, res) => {
+  const { to, message, sessionId } = req.query;
+  const targetId = sanitizeSessionId(sessionId) || DEFAULT_SESSION_ID;
+  if (!to || !message || !targetId) return res.json({ status: false, message: "Missing required fields" });
+  try {
+    const session = sessions.get(targetId);
+    if (!session || session.status !== "connected" || !session.sock) {
+      return res.json({ status: false, message: "Device not connected" });
+    }
+    
+    if (!session.sendQueue) session.sendQueue = Promise.resolve();
+    
+    session.sendQueue = session.sendQueue
+      .then(() => new Promise((r) => setTimeout(r, 1000)))
+      .then(() => session.sock.sendMessage(`${String(to).replace(/\D/g, "")}@s.whatsapp.net`, { text: message }));
+
+    await session.sendQueue;
+    res.json({ status: true });
+  } catch (err) {
+    res.json({ status: false, message: err.message });
+  }
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    status: true,
+    auth: useSupabaseAuth ? "supabase" : "filesystem",
+    webhookConfigured: Boolean(WEBHOOK_URL),
+    sessions: [...sessions.values()].map((s) => ({
+      id: s.id,
+      status: s.status,
+      panelDeviceId: s.panelDeviceId || null,
+    })),
+  });
+});
+
+const server = app.listen(PORT, () => {
+  logger.info({ port: PORT, auth: useSupabaseAuth ? "supabase" : "filesystem" }, "listening");
+});
+
+async function autoStartSavedSessions() {
+  if (!supabase || !currentIsLeader()) return;
+  try {
+    const { data: devices, error } = await supabase
+      .from("devices")
+      .select("id, session_data, status");
+    if (error) throw error;
+
+    const activeDevices = (devices || []).filter(
+      (d) => !["deleted", "disconnected"].includes(d.status)
+    );
+
+    logger.info({ count: activeDevices.length }, "auto_start_finding_active_devices");
+    
+    let delay = 0;
+    for (const device of activeDevices) {
+      const sessionId = device.session_data || device.id;
+      logger.info({ id: sessionId, deviceId: device.id }, "auto_starting_saved_session");
+      setTimeout(() => {
+        connectSession(sessionId, { panelDeviceId: device.id }).catch((err) => {
+          logger.error({ id: sessionId, err: String(err) }, "auto_start_saved_failed");
+        });
+      }, delay);
+      delay += 1500; // Stagger startups
+    }
+  } catch (err) {
+    logger.error({ err: String(err) }, "auto_start_saved_sessions_error");
+  }
+}
+
+if (AUTO_START_DEFAULT) {
+  connectSession(DEFAULT_SESSION_ID, {}).catch((err) => logger.error({ err: String(err) }, "auto_start_failed"));
+}
+
+setTimeout(async () => {
+  await initLeaderElection(
+    redisConnection,
+    // onElected
+    () => {
+      if (webhookQueue.worker) webhookQueue.worker.resume();
+      autoStartSavedSessions();
+    },
+    // onDemoted
+    () => {
+      if (webhookQueue.worker) webhookQueue.worker.pause();
+      // Optional: stop active sessions if strict single-active needed
+    }
+  );
+  if (currentIsLeader()) {
+    autoStartSavedSessions();
+  }
+}, 2000);
+
+async function shutdown() {
+  logger.info("shutdown");
+  for (const session of sessions.values()) await closeSession(session);
+  server.close(() => process.exit(0));
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
