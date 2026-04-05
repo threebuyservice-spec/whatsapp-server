@@ -57,10 +57,19 @@ if (!useSupabaseAuth) {
   );
 }
 
-const WEBHOOK_URL =
+let RAW_WEBHOOK_URL =
   process.env.WHATSAPP_WEBHOOK_URL ||
   process.env.WEBHOOK_URL ||
   "";
+
+// Robust fix: if the user provided the domain but missed /api/webhooks prefix
+if (RAW_WEBHOOK_URL && RAW_WEBHOOK_URL.endsWith("/whatsapp/incoming")) {
+  if (!RAW_WEBHOOK_URL.includes("/api/webhooks/")) {
+    RAW_WEBHOOK_URL = RAW_WEBHOOK_URL.replace("/whatsapp/incoming", "/api/webhooks/whatsapp/incoming");
+  }
+}
+
+const WEBHOOK_URL = RAW_WEBHOOK_URL;
 const SESSION_WEBHOOK_URL = process.env.WHATSAPP_SESSION_WEBHOOK_URL || 
   (WEBHOOK_URL ? WEBHOOK_URL.replace("/whatsapp/incoming", "/whatsapp/session") : "");
 const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || "";
