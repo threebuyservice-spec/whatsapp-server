@@ -61,6 +61,8 @@ const WEBHOOK_URL =
   process.env.WHATSAPP_WEBHOOK_URL ||
   process.env.WEBHOOK_URL ||
   "";
+const SESSION_WEBHOOK_URL = process.env.WHATSAPP_SESSION_WEBHOOK_URL || 
+  (WEBHOOK_URL ? WEBHOOK_URL.replace("/whatsapp/incoming", "/whatsapp/session") : "");
 const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || "";
 const API_SECRET = process.env.API_SECRET || "";
 const ENABLE_EVENT_WRAPPER = process.env.ENABLE_EVENT_WRAPPER === "true";
@@ -202,13 +204,15 @@ function requireApiAuth(req, res, next) {
 }
 
 const webhookQueue = createQueue("webhooks", async (jobData) => {
-  const { sessionId, body } = jobData;
+  const { sessionId, body, targetUrl } = jobData;
   const session = sessions.get(sessionId) || { log: logger.child({ sessionId }) };
   
+  if (!targetUrl) throw new Error("No targetUrl for webhook");
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-  const res = await fetch(WEBHOOK_URL, {
+  const res = await fetch(targetUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -224,7 +228,7 @@ const webhookQueue = createQueue("webhooks", async (jobData) => {
     throw new Error(`HTTP error! status: ${res.status}`);
   }
 
-  session.log.debug({ status: res.status }, "webhook_ok");
+  session.log.debug({ status: res.status, url: targetUrl }, "webhook_ok");
 });
 
 // Pause locally until we are elected leader if Redis is active
@@ -241,6 +245,7 @@ async function postWebhook(session, structuredPayload) {
   const deviceId = await resolvePanelDeviceId(session);
   
   let finalBody = {};
+  let targetUrl = WEBHOOK_URL;
   
   if (structuredPayload.type === "message" && !ENABLE_EVENT_WRAPPER) {
     // Keep legacy flat structure for messages, to not break BFF
@@ -249,8 +254,16 @@ async function postWebhook(session, structuredPayload) {
       sessionId: session.id,
       ...(deviceId ? { device_id: deviceId } : {}),
     };
+  } else if (structuredPayload.type === "connection") {
+    // Session lifecycle event
+    targetUrl = SESSION_WEBHOOK_URL;
+    finalBody = {
+      sessionId: session.id,
+      event: structuredPayload.event,
+      meta: structuredPayload.payload || {},
+    };
   } else {
-    // Safe wrapped mode or connection event
+    // Safe wrapped mode (standard envelope)
     finalBody = {
       type: structuredPayload.type,
       device_id: deviceId || session.id,
@@ -261,7 +274,7 @@ async function postWebhook(session, structuredPayload) {
     };
   }
 
-  webhookQueue.add("webhook", { sessionId: session.id, body: finalBody }, { attempts: 5 });
+  webhookQueue.add("webhook", { sessionId: session.id, body: finalBody, targetUrl }, { attempts: 5 });
 }
 
 async function postIncomingWebhook(session, payload) {
