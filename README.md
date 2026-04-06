@@ -39,8 +39,13 @@ Body: `{ "device_id": "<uuid>", "force": true }`
 | `RECONNECT_BASE_MS` | Initial reconnect delay (default 3000) |
 | `RECONNECT_MAX_MS` | Cap for exponential backoff (default 120000) |
 | `QR_THROTTLE_MS` | Min interval between QR writes to `devices` |
+| `REDIS_URL` | **Required for Enterprise features** (internal Railway URL: `redis://...@redis.railway.internal:6379`). DO NOT use `REDIS_PUBLIC_URL` locally as it will incur egress costs and potential latency issues on Railway. |
 
-## Run
+## Enterprise Level 2 Features (Redis)
+
+- **BullMQ Persistence:** When `REDIS_URL` is set, all webhooks and incoming messages are handled via durable Redis queues instead of an in-memory fallback.
+- **Master-Node Leader Election:** Prevents duplicated work and conflicting TCP connections in multi-region deployments.
+- **Failover:** If the leader server goes down, another node takes over seamlessly.
 
 ```bash
 npm ci
