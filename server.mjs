@@ -57,24 +57,34 @@ if (!useSupabaseAuth) {
   );
 }
 
-let RAW_WEBHOOK_URL =
-  process.env.WHATSAPP_WEBHOOK_URL ||
-  process.env.WEBHOOK_URL ||
-  "";
-
-// Robust fix: if the user provided the domain but missed /api/webhooks prefix
-if (RAW_WEBHOOK_URL && RAW_WEBHOOK_URL.endsWith("/whatsapp/incoming")) {
-  if (!RAW_WEBHOOK_URL.includes("/api/webhooks/")) {
-    RAW_WEBHOOK_URL = RAW_WEBHOOK_URL.replace("/whatsapp/incoming", "/api/webhooks/whatsapp/incoming");
-  }
-}
-
-const WEBHOOK_URL = RAW_WEBHOOK_URL;
-const SESSION_WEBHOOK_URL = process.env.WHATSAPP_SESSION_WEBHOOK_URL || 
-  (WEBHOOK_URL ? WEBHOOK_URL.replace("/whatsapp/incoming", "/whatsapp/session") : "");
 const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || "";
 const API_SECRET = process.env.API_SECRET || "";
 const ENABLE_EVENT_WRAPPER = process.env.ENABLE_EVENT_WRAPPER === "true";
+
+function normalizeWebhookUrls(raw) {
+  if (!raw) return { webhookUrl: "", sessionUrl: "" };
+  let webhookUrl = raw.trim();
+  
+  // Ensure we have a valid URL tail for the BFF
+  if (webhookUrl.endsWith("/whatsapp/incoming")) {
+    if (!webhookUrl.includes("/api/webhooks/")) {
+      webhookUrl = webhookUrl.replace("/whatsapp/incoming", "/api/webhooks/whatsapp/incoming");
+    }
+  } else if (!webhookUrl.includes("/api/webhooks/")) {
+    // If user provided just the base domain, append the full expected path
+    if (webhookUrl.endsWith("/")) webhookUrl = webhookUrl.slice(0, -1);
+    webhookUrl = `${webhookUrl}/api/webhooks/whatsapp/incoming`;
+  }
+
+  const sessionUrl = process.env.WHATSAPP_SESSION_WEBHOOK_URL || webhookUrl.replace("/whatsapp/incoming", "/whatsapp/session");
+  return { webhookUrl, sessionUrl };
+}
+
+const { webhookUrl: WEBHOOK_URL, sessionUrl: SESSION_WEBHOOK_URL } = normalizeWebhookUrls(
+  process.env.WHATSAPP_WEBHOOK_URL || process.env.WEBHOOK_URL || ""
+);
+
+logger.info({ WEBHOOK_URL, SESSION_WEBHOOK_URL }, "webhook_urls_initialized");
 
 const sessions = new Map();
 const connectingNow = new Set();
@@ -218,22 +228,53 @@ const webhookQueue = createQueue("webhooks", async (jobData) => {
   
   if (!targetUrl) throw new Error("No targetUrl for webhook");
 
+  session.log.info({ url: targetUrl, method: "POST" }, "webhook_dispatching");
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-  const res = await fetch(targetUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-webhook-secret": WEBHOOK_SECRET,
-    },
-    body: JSON.stringify(body),
-    signal: controller.signal,
-  });
-
-  clearTimeout(timeoutId);
+  let res;
+  try {
+    res = await fetch(targetUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": WEBHOOK_SECRET,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      session.log.error({ url: targetUrl }, "webhook_timeout");
+      throw new Error("Webhook timeout after 10s");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!res.ok) {
+    const responseBody = await res.text().catch(() => "N/A");
+    session.log.error(
+      { 
+        status: res.status, 
+        url: targetUrl, 
+        response: responseBody.slice(0, 500), // Protect log size
+        method: "POST"
+      }, 
+      "webhook_failed"
+    );
+    
+    // Status-specific verbose logs for troubleshooting
+    if (res.status === 404) {
+      session.log.error({ url: targetUrl }, "webhook_endpoint_not_found");
+    } else if (res.status === 401) {
+      session.log.error("webhook_unauthorized_check_secret");
+    } else if (res.status === 400) {
+      session.log.error({ responseBody }, "webhook_bad_request_payload_mismatch");
+    }
+
     throw new Error(`HTTP error! status: ${res.status}`);
   }
 
