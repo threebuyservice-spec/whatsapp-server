@@ -421,7 +421,7 @@ function reconnectDelayMs(session) {
   return exp + jitter;
 }
 
-function scheduleReconnect(session) {
+function scheduleReconnect(session, forceDelayMs = null) {
   if (!session.shouldReconnect) return;
   clearReconnectTimer(session);
   session.status = "reconnecting";
@@ -429,7 +429,7 @@ function scheduleReconnect(session) {
   session.updatedAt = nowIso();
   session.lastQrSavedAt = 0;
 
-  const delay = reconnectDelayMs(session);
+  const delay = forceDelayMs ?? reconnectDelayMs(session);
   session.log.info({ delayMs: delay, attempt: session.reconnectAttempts }, "reconnect_scheduled");
 
   session.reconnectTimer = setTimeout(() => {
@@ -569,7 +569,10 @@ async function connectSession(sessionId, opts = {}) {
       version,
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
+      keepAliveIntervalMs: 25_000, // Keep stream alive
+      retryRequestDelayMs: 2000,   // Be more patient with retries
       shouldSyncHistoryMessage: () => false,
+      syncFullHistory: false,
       markOnlineOnConnect: true,
       logger: createBaileysLogger(),
     });
@@ -641,11 +644,14 @@ async function connectSession(sessionId, opts = {}) {
         session.updatedAt = nowIso();
         session.sock = null;
 
+        const isStreamError = statusCode === 515;
+
         session.log.warn(
           { 
             statusCode, 
             reason: lastDisconnect?.error?.message,
-            currentStatus: session.status 
+            currentStatus: session.status,
+            isStreamError
           },
           "connection_close"
         );
@@ -660,17 +666,20 @@ async function connectSession(sessionId, opts = {}) {
         }
 
         // Special case: if we were JUST scanning/connecting and it closed without logout, 
-        // it's likely the "restart after pairing" event. 
-        // We MUST ensure creds are saved (done in creds.update) and wait a bit before reconnect.
+        // it's likely the "restart after pairing" event, or a transient 515.
+        // We MUST ensure creds are saved and wait a bit before reconnect to avoid interrupting pairing.
         const wasPairing = session.status === "scanning" || session.status === "qr_ready";
-        if (wasPairing) {
-          session.log.info({ statusCode }, "disconnect_during_pairing_handshake_will_resume");
+        if (wasPairing || isStreamError) {
+          session.log.info({ statusCode, isStreamError }, "disconnect_during_handshake_will_resume_shortly");
           // Update status to prevent handleQR from replacing it with a new QR too fast
           session.status = "connecting"; 
         }
 
         postWebhook(session, { type: "connection", event: "error", payload: { statusCode, reason: lastDisconnect?.error?.message } });
-        scheduleReconnect(session);
+        
+        // Increase delay for Stream Errors to let the remote server settle
+        const delayMs = isStreamError ? 5000 : undefined;
+        scheduleReconnect(session, delayMs);
       }
     });
 
