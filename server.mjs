@@ -23,7 +23,8 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = Number(process.env.PORT || 3000);
 const AUTH_ROOT = path.resolve(process.env.AUTH_ROOT || "auth_info");
 const DEFAULT_SESSION_ID = sanitizeSessionId(process.env.DEFAULT_SESSION_ID || "default") || "default";
-const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT !== "false";
+// By default, only auto-start based on devices DB in production.
+const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT === "true";
 
 const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 3000);
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
@@ -258,6 +259,7 @@ const webhookQueue = createQueue("webhooks", async (jobData) => {
     const responseBody = await res.text().catch(() => "N/A");
     session.log.error(
       { 
+        sessionId,
         status: res.status, 
         url: targetUrl, 
         response: responseBody.slice(0, 500), // Protect log size
@@ -268,17 +270,17 @@ const webhookQueue = createQueue("webhooks", async (jobData) => {
     
     // Status-specific verbose logs for troubleshooting
     if (res.status === 404) {
-      session.log.error({ url: targetUrl }, "webhook_endpoint_not_found");
+      session.log.error({ sessionId, url: targetUrl }, "webhook_endpoint_not_found");
     } else if (res.status === 401) {
-      session.log.error("webhook_unauthorized_check_secret");
+      session.log.error({ sessionId }, "webhook_unauthorized_check_secret");
     } else if (res.status === 400) {
-      session.log.error({ responseBody }, "webhook_bad_request_payload_mismatch");
+      session.log.error({ sessionId, responseBody }, "webhook_bad_request_payload_mismatch");
     }
 
     throw new Error(`HTTP error! status: ${res.status}`);
   }
 
-  session.log.debug({ status: res.status, url: targetUrl }, "webhook_ok");
+  session.log.debug({ sessionId, status: res.status, url: targetUrl }, "webhook_ok");
 });
 
 // Pause locally until we are elected leader if Redis is active
@@ -293,6 +295,13 @@ async function postWebhook(session, structuredPayload) {
   }
   
   const deviceId = await resolvePanelDeviceId(session);
+  
+  // Prevent noisy webhook failures if the panel has no device matching this session.
+  // This typically occurs for the 'default' session or manually started orphan sessions.
+  if (!deviceId) {
+    session.log.debug({ sessionId: session.id, event: structuredPayload.event }, "webhook_skipped_no_panel_device");
+    return;
+  }
   
   let finalBody = {};
   let targetUrl = WEBHOOK_URL;
