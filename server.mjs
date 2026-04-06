@@ -444,6 +444,8 @@ function scheduleReconnect(session) {
 }
 
 async function handleQR(session, qr) {
+  session.log.debug({ qrHash: qr.slice(0, 10) }, "handle_qr_event_received");
+  
   let dataUrl;
   try {
     dataUrl = await QRCode.toDataURL(qr);
@@ -456,6 +458,9 @@ async function handleQR(session, qr) {
   }
 
   session.qrDataUrl = dataUrl;
+  
+  // Track previous status to see what we are transitioning from
+  const oldStatus = session.status;
   session.status = "qr_ready";
   session.updatedAt = nowIso();
 
@@ -463,13 +468,13 @@ async function handleQR(session, qr) {
   const elapsed = now - session.lastQrSavedAt;
 
   if (elapsed < QR_THROTTLE_MS) {
-    session.log.debug("qr_throttled_skip_db");
+    session.log.debug({ elapsed, oldStatus }, "qr_throttled_skip_db");
     return;
   }
 
   session.lastQrSavedAt = now;
   session.qrSaveCount += 1;
-  session.log.info({ n: session.qrSaveCount }, "qr_saved_db");
+  session.log.info({ n: session.qrSaveCount, from: oldStatus }, "qr_saved_db");
 
   await updateSupabaseDevice(session.id, {
     qr_code: dataUrl,
@@ -574,8 +579,14 @@ async function connectSession(sessionId, opts = {}) {
     session.qrDataUrl = null;
     session.updatedAt = nowIso();
 
-    sock.ev.on("creds.update", () => {
-      if (session.sock === sock) saveCreds();
+    sock.ev.on("creds.update", async () => {
+      if (session.sock !== sock) return;
+      try {
+        await saveCreds();
+        session.log.debug("creds_saved_success");
+      } catch (err) {
+        session.log.error({ err: err.message }, "creds_save_failed");
+      }
     });
 
     bindMessagesUpsert(session, sock);
@@ -584,7 +595,16 @@ async function connectSession(sessionId, opts = {}) {
       if (session.sock !== sock) return;
       const { connection, qr, lastDisconnect } = update;
 
-      if (qr) await handleQR(session, qr);
+      if (qr) {
+        // Debounce: if we just scanned or are connected, ignore new QRs for 15s
+        const now = Date.now();
+        const stateAge = now - new Date(session.updatedAt || 0).getTime();
+        if (session.status === "connected" || (session.status === "scanning" && stateAge < 15_000)) {
+          session.log.debug({ status: session.status, stateAge }, "qr_ignored_during_handshake");
+          return;
+        }
+        await handleQR(session, qr);
+      }
 
       if (connection === "open") {
         session.status = "connected";
@@ -622,7 +642,11 @@ async function connectSession(sessionId, opts = {}) {
         session.sock = null;
 
         session.log.warn(
-          { statusCode, reason: lastDisconnect?.error?.message },
+          { 
+            statusCode, 
+            reason: lastDisconnect?.error?.message,
+            currentStatus: session.status 
+          },
           "connection_close"
         );
 
@@ -633,6 +657,16 @@ async function connectSession(sessionId, opts = {}) {
           await updateSupabaseDevice(id, { status: "disconnected", qr_code: null });
           postWebhook(session, { type: "connection", event: "disconnected", payload: { reason: "logged_out" } });
           return;
+        }
+
+        // Special case: if we were JUST scanning/connecting and it closed without logout, 
+        // it's likely the "restart after pairing" event. 
+        // We MUST ensure creds are saved (done in creds.update) and wait a bit before reconnect.
+        const wasPairing = session.status === "scanning" || session.status === "qr_ready";
+        if (wasPairing) {
+          session.log.info({ statusCode }, "disconnect_during_pairing_handshake_will_resume");
+          // Update status to prevent handleQR from replacing it with a new QR too fast
+          session.status = "connecting"; 
         }
 
         postWebhook(session, { type: "connection", event: "error", payload: { statusCode, reason: lastDisconnect?.error?.message } });
