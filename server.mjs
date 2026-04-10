@@ -486,7 +486,7 @@ async function handleQR(session, qr) {
   
   // Track previous status to see what we are transitioning from
   const oldStatus = session.status;
-  session.status = "qr_ready";
+  session.status = "qr_pending";
   session.updatedAt = nowIso();
 
   const now = Date.now();
@@ -503,13 +503,13 @@ async function handleQR(session, qr) {
 
   await updateSupabaseDevice(session.id, {
     qr_code: dataUrl,
-    status: "scanning",
+    status: "qr_pending",
   });
 
   await postWebhook(session, {
     type: "connection",
     event: "qr",
-    payload: { status: "scanning", qr_code: dataUrl }
+    payload: { status: "qr_pending", qr_code: dataUrl }
   });
 }
 
@@ -538,7 +538,7 @@ async function connectSession(sessionId, opts = {}) {
 
   if (
     !force &&
-    (session.status === "connected" || session.status === "connecting" || session.status === "qr_ready")
+    (session.status === "connected" || session.status === "connecting" || session.status === "qr_pending")
   ) {
     const elapsed = Date.now() - new Date(session.updatedAt).getTime();
     if (elapsed < 30_000) {
@@ -625,13 +625,12 @@ async function connectSession(sessionId, opts = {}) {
 
       if (qr) {
         // Debounce: suppress new QRs when already connected or freshly in the
-        // QR handshake window (status is "qr_ready" or "scanning") to avoid
+        // QR handshake window (status is "qr_pending") to avoid
         // overwriting a pairing in progress.
         const now = Date.now();
         const stateAge = now - new Date(session.updatedAt || 0).getTime();
         const inHandshake =
-          session.status === "qr_ready" ||
-          session.status === "scanning" ||
+          session.status === "qr_pending" ||
           session.status === "connected";
         if (inHandshake && stateAge < QR_THROTTLE_MS) {
           session.log.debug(
@@ -690,8 +689,7 @@ async function connectSession(sessionId, opts = {}) {
         const isStreamError = statusCode === 515;
         // Closed while the user was scanning the QR — likely the normal
         // "restart after pairing" event.  Do NOT count this as a hard error.
-        const wasPairing =
-          session.status === "qr_ready" || session.status === "scanning";
+        const wasPairing = session.status === "qr_pending";
 
         session.log.warn(
           {
