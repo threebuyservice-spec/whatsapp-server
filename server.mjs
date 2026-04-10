@@ -65,19 +65,23 @@ const ENABLE_EVENT_WRAPPER = process.env.ENABLE_EVENT_WRAPPER === "true";
 function normalizeWebhookUrls(raw) {
   if (!raw) return { webhookUrl: "", sessionUrl: "" };
   let webhookUrl = raw.trim();
-  
-  // Ensure we have a valid URL tail for the BFF
+  if (webhookUrl.endsWith("/")) webhookUrl = webhookUrl.slice(0, -1);
+
+  // Normalise to the canonical BFF incoming path
   if (webhookUrl.endsWith("/whatsapp/incoming")) {
     if (!webhookUrl.includes("/api/webhooks/")) {
       webhookUrl = webhookUrl.replace("/whatsapp/incoming", "/api/webhooks/whatsapp/incoming");
     }
   } else if (!webhookUrl.includes("/api/webhooks/")) {
-    // If user provided just the base domain, append the full expected path
-    if (webhookUrl.endsWith("/")) webhookUrl = webhookUrl.slice(0, -1);
     webhookUrl = `${webhookUrl}/api/webhooks/whatsapp/incoming`;
   }
 
-  const sessionUrl = process.env.WHATSAPP_SESSION_WEBHOOK_URL || webhookUrl.replace("/whatsapp/incoming", "/whatsapp/session");
+  // Session-lifecycle events go to the same endpoint by default (single-endpoint panels).
+  // Override with WHATSAPP_SESSION_WEBHOOK_URL if your panel uses a separate route.
+  const sessionUrl =
+    process.env.WHATSAPP_SESSION_WEBHOOK_URL ||
+    webhookUrl.replace("/whatsapp/incoming", "/whatsapp/session");
+
   return { webhookUrl, sessionUrl };
 }
 
@@ -293,53 +297,74 @@ async function postWebhook(session, structuredPayload) {
     session.log.warn("WHATSAPP_WEBHOOK_URL not set; skipping webhook");
     return;
   }
-  
+
   const deviceId = await resolvePanelDeviceId(session);
-  
+
   // Prevent noisy webhook failures if the panel has no device matching this session.
   // This typically occurs for the 'default' session or manually started orphan sessions.
   if (!deviceId) {
-    session.log.debug({ sessionId: session.id, event: structuredPayload.event }, "webhook_skipped_no_panel_device");
+    session.log.debug(
+      { sessionId: session.id, event: structuredPayload.event },
+      "webhook_skipped_no_panel_device"
+    );
     return;
   }
-  
+
+  // The canonical session identifier sent to the panel must match devices.session_data.
+  // If the session was started by UUID (panelDeviceId === session.id), the panel still
+  // needs session_data in the payload so it can look up the row. We always send the
+  // human/slug sessionId (session.id as stored in this process) as `sessionId` and the
+  // UUID as `device_id` so the panel can correlate by either field.
+  const canonicalSessionId = session.id;
+
   let finalBody = {};
   let targetUrl = WEBHOOK_URL;
-  
+
   if (structuredPayload.type === "message" && !ENABLE_EVENT_WRAPPER) {
-    // Keep legacy flat structure for messages, to not break BFF
+    // Flat legacy structure expected by most panel BFF routes
     finalBody = {
       ...structuredPayload.payload,
-      sessionId: session.id,
-      ...(deviceId ? { device_id: deviceId } : {}),
+      sessionId: canonicalSessionId,
+      device_id: deviceId,
     };
   } else if (structuredPayload.type === "connection") {
-    // Session lifecycle event
+    // Session lifecycle events — always include device_id so the panel can
+    // map the event without a secondary DB look-up.
     targetUrl = SESSION_WEBHOOK_URL;
     finalBody = {
-      sessionId: session.id,
+      sessionId: canonicalSessionId,
+      device_id: deviceId,
       event: structuredPayload.event,
       meta: structuredPayload.payload || {},
+      timestamp: Date.now(),
     };
   } else {
-    // Safe wrapped mode (standard envelope)
+    // Wrapped envelope mode
     finalBody = {
       type: structuredPayload.type,
-      device_id: deviceId || session.id,
-      sessionId: session.id,
+      device_id: deviceId,
+      sessionId: canonicalSessionId,
       event: structuredPayload.event,
       payload: structuredPayload.payload,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
   }
 
-  webhookQueue.add("webhook", { sessionId: session.id, body: finalBody, targetUrl }, { attempts: 5 });
+  webhookQueue.add(
+    "webhook",
+    { sessionId: session.id, body: finalBody, targetUrl },
+    {
+      attempts: 5,
+      backoff: { type: "exponential", delay: 2000 },
+    }
+  );
 }
 
 async function postIncomingWebhook(session, payload) {
   await postWebhook(session, {
     type: "message",
-    payload
+    event: "incoming_message",
+    payload,
   });
 }
 
@@ -599,11 +624,20 @@ async function connectSession(sessionId, opts = {}) {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        // Debounce: if we just scanned or are connected, ignore new QRs for 15s
+        // Debounce: suppress new QRs when already connected or freshly in the
+        // QR handshake window (status is "qr_ready" or "scanning") to avoid
+        // overwriting a pairing in progress.
         const now = Date.now();
         const stateAge = now - new Date(session.updatedAt || 0).getTime();
-        if (session.status === "connected" || (session.status === "scanning" && stateAge < 15_000)) {
-          session.log.debug({ status: session.status, stateAge }, "qr_ignored_during_handshake");
+        const inHandshake =
+          session.status === "qr_ready" ||
+          session.status === "scanning" ||
+          session.status === "connected";
+        if (inHandshake && stateAge < QR_THROTTLE_MS) {
+          session.log.debug(
+            { status: session.status, stateAge },
+            "qr_ignored_during_handshake"
+          );
           return;
         }
         await handleQR(session, qr);
@@ -619,10 +653,16 @@ async function connectSession(sessionId, opts = {}) {
         session.updatedAt = nowIso();
         session.log.info("connection_open");
 
+        // Eagerly persist device_id so every subsequent webhook includes it.
         await resolvePanelDeviceId(session);
 
-        const phoneNumber = sock.user?.id?.split(":")[0]?.split("@")[0] || null;
-        const profileName = sock.user?.name || sock.user?.verifiedName || phoneNumber || "WhatsApp Device";
+        const phoneNumber =
+          sock.user?.id?.split(":")[0]?.split("@")[0] || null;
+        const profileName =
+          sock.user?.name ||
+          sock.user?.verifiedName ||
+          phoneNumber ||
+          "WhatsApp Device";
 
         await updateSupabaseDevice(id, {
           status: "connected",
@@ -634,24 +674,32 @@ async function connectSession(sessionId, opts = {}) {
         await postWebhook(session, {
           type: "connection",
           event: "connected",
-          payload: { phone_number: phoneNumber, name: profileName }
+          payload: { phone_number: phoneNumber, name: profileName },
         });
       }
 
       if (connection === "close") {
-        const statusCode = lastDisconnect?.error?.output?.statusCode ?? null;
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode ?? null;
+        const reason = lastDisconnect?.error?.message ?? "unknown";
         session.lastDisconnectCode = statusCode;
         session.updatedAt = nowIso();
         session.sock = null;
 
+        // 515 = stream replaced / server-side reset
         const isStreamError = statusCode === 515;
+        // Closed while the user was scanning the QR — likely the normal
+        // "restart after pairing" event.  Do NOT count this as a hard error.
+        const wasPairing =
+          session.status === "qr_ready" || session.status === "scanning";
 
         session.log.warn(
-          { 
-            statusCode, 
-            reason: lastDisconnect?.error?.message,
+          {
+            statusCode,
+            reason,
             currentStatus: session.status,
-            isStreamError
+            isStreamError,
+            wasPairing,
           },
           "connection_close"
         );
@@ -661,24 +709,37 @@ async function connectSession(sessionId, opts = {}) {
           session.shouldReconnect = false;
           session.qrDataUrl = null;
           await updateSupabaseDevice(id, { status: "disconnected", qr_code: null });
-          postWebhook(session, { type: "connection", event: "disconnected", payload: { reason: "logged_out" } });
+          // Fire-and-forget — we are shutting down this session anyway.
+          postWebhook(session, {
+            type: "connection",
+            event: "disconnected",
+            payload: { reason: "logged_out" },
+          });
           return;
         }
 
-        // Special case: if we were JUST scanning/connecting and it closed without logout, 
-        // it's likely the "restart after pairing" event, or a transient 515.
-        // We MUST ensure creds are saved and wait a bit before reconnect to avoid interrupting pairing.
-        const wasPairing = session.status === "scanning" || session.status === "qr_ready";
         if (wasPairing || isStreamError) {
-          session.log.info({ statusCode, isStreamError }, "disconnect_during_handshake_will_resume_shortly");
-          // Update status to prevent handleQR from replacing it with a new QR too fast
-          session.status = "connecting"; 
+          // Transition to a neutral status so that a new QR from the server
+          // does NOT get suppressed by the debounce check above.
+          session.status = "connecting";
+          session.log.info(
+            { statusCode, isStreamError, wasPairing },
+            "disconnect_during_handshake_will_resume_shortly"
+          );
         }
 
-        postWebhook(session, { type: "connection", event: "error", payload: { statusCode, reason: lastDisconnect?.error?.message } });
-        
-        // Increase delay for Stream Errors to let the remote server settle
-        const delayMs = isStreamError ? 5000 : undefined;
+        // Notify the panel about the transient error.
+        postWebhook(session, {
+          type: "connection",
+          event: "error",
+          payload: { statusCode, reason },
+        });
+
+        // Longer delay for stream errors and pairing interruptions to let the
+        // WhatsApp server fully process the credential exchange before we try again.
+        let delayMs;
+        if (isStreamError) delayMs = 8_000;
+        else if (wasPairing) delayMs = 5_000;
         scheduleReconnect(session, delayMs);
       }
     });
@@ -877,17 +938,29 @@ async function autoStartSavedSessions() {
     );
 
     logger.info({ count: activeDevices.length }, "auto_start_finding_active_devices");
-    
+
     let delay = 0;
     for (const device of activeDevices) {
-      const sessionId = device.session_data || device.id;
-      logger.info({ id: sessionId, deviceId: device.id }, "auto_starting_saved_session");
+      // Always prefer session_data (the canonical slug stored in the panel DB).
+      // Fall back to the UUID only when session_data is absent so that
+      // resolvePanelDeviceId can still match the row via devices.id.
+      const sessionId =
+        device.session_data && device.session_data.trim()
+          ? device.session_data.trim()
+          : device.id;
+
+      logger.info(
+        { id: sessionId, deviceId: device.id, session_data: device.session_data },
+        "auto_starting_saved_session"
+      );
+
       setTimeout(() => {
         connectSession(sessionId, { panelDeviceId: device.id }).catch((err) => {
           logger.error({ id: sessionId, err: String(err) }, "auto_start_saved_failed");
         });
       }, delay);
-      delay += 1500; // Stagger startups
+
+      delay += 1500; // Stagger startups to avoid thundering-herd on Baileys
     }
   } catch (err) {
     logger.error({ err: String(err) }, "auto_start_saved_sessions_error");
