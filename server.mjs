@@ -720,18 +720,26 @@ async function connectSession(sessionId, opts = {}) {
           // Transition to a neutral status so that a new QR from the server
           // does NOT get suppressed by the debounce check above.
           session.status = "connecting";
+          session.qrDataUrl = null;
+          await updateSupabaseDevice(id, { status: "connecting", qr_code: null });
           session.log.info(
             { statusCode, isStreamError, wasPairing },
             "disconnect_during_handshake_will_resume_shortly"
           );
+          postWebhook(session, {
+            type: "connection",
+            event: "connecting",
+            payload: { statusCode, reason, transient: true },
+          });
+        } else {
+          // Only notify the panel about a hard error when the close was not
+          // the expected QR pairing restart / stream replacement.
+          postWebhook(session, {
+            type: "connection",
+            event: "error",
+            payload: { statusCode, reason },
+          });
         }
-
-        // Notify the panel about the transient error.
-        postWebhook(session, {
-          type: "connection",
-          event: "error",
-          payload: { statusCode, reason },
-        });
 
         // Longer delay for stream errors and pairing interruptions to let the
         // WhatsApp server fully process the credential exchange before we try again.
