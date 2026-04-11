@@ -167,7 +167,9 @@ async function updateSupabaseDevice(sessionId, data) {
   const session = sessions.get(sessionId);
   try {
     let query = supabase.from("devices").update({ ...data, updated_date: nowIso() });
-    if (isUuid(sessionId)) {
+    if (session?.panelDeviceId && isUuid(session.panelDeviceId)) {
+      query = query.eq("id", session.panelDeviceId);
+    } else if (isUuid(sessionId)) {
       query = query.eq("id", sessionId);
     } else {
       query = query.eq("session_data", sessionId);
@@ -187,30 +189,90 @@ async function updateSupabaseDevice(sessionId, data) {
   }
 }
 
-/** Resolve panel devices.id for webhook (matches session_data = session id). */
-async function resolvePanelDeviceId(session) {
-  if (session.panelDeviceId && isUuid(session.panelDeviceId)) return session.panelDeviceId;
-  if (isUuid(session.id)) {
-    session.panelDeviceId = session.id;
-    return session.id;
-  }
-  if (!supabase) return null;
+/**
+ * Bind panel devices.id to this Baileys session key (devices.session_data).
+ * Call on connect when the panel sends the canonical device UUID.
+ */
+async function bindPanelDeviceToSession(session, panelDeviceId) {
+  if (!supabase || !panelDeviceId || !isUuid(panelDeviceId)) return;
   try {
-    const { data, error } = await supabase
+    const { error } = await supabase
+      .from("devices")
+      .update({ session_data: session.id, updated_date: nowIso() })
+      .eq("id", panelDeviceId);
+    if (error) {
+      session.log.warn({ msg: error.message, panelDeviceId }, "bind_panel_device_session_data_failed");
+      return;
+    }
+    session.panelDeviceId = panelDeviceId;
+    session.log.info(
+      { panel_device_id: panelDeviceId, sessionId: session.id },
+      "panel_device_session_data_bound"
+    );
+  } catch (e) {
+    session.log.warn({ err: String(e), panelDeviceId }, "bind_panel_device_exception");
+  }
+}
+
+/**
+ * Resolve panel devices.id for webhooks — only UUIDs that exist in `devices`.
+ * Never treat an arbitrary UUID session slug as devices.id without a DB row.
+ */
+async function resolvePanelDeviceId(session) {
+  if (!supabase) {
+    if (session.panelDeviceId && isUuid(session.panelDeviceId)) return session.panelDeviceId;
+    return null;
+  }
+  try {
+    const { data: bySessionData, error: err1 } = await supabase
       .from("devices")
       .select("id")
       .eq("session_data", session.id)
       .limit(1)
       .maybeSingle();
-    if (error) {
-      session.log.warn({ msg: error.message }, "resolve_device_id_error");
-      return null;
+    if (err1) session.log.warn({ msg: err1.message }, "resolve_device_id_session_data_error");
+    if (bySessionData?.id) {
+      session.panelDeviceId = bySessionData.id;
+      session.log = session.log.child({ device_id: bySessionData.id });
+      session.log.info({ deviceId: bySessionData.id }, "device_id_resolved_by_session_data");
+      return bySessionData.id;
     }
-    if (data?.id) {
-      session.panelDeviceId = data.id;
-      session.log = session.log.child({ device_id: data.id });
-      session.log.info({ deviceId: data.id }, "device_id_resolved");
-      return data.id;
+
+    if (isUuid(session.id)) {
+      const { data: byId, error: err2 } = await supabase
+        .from("devices")
+        .select("id")
+        .eq("id", session.id)
+        .limit(1)
+        .maybeSingle();
+      if (err2) session.log.warn({ msg: err2.message }, "resolve_device_id_uuid_error");
+      if (byId?.id) {
+        session.panelDeviceId = byId.id;
+        session.log = session.log.child({ device_id: byId.id });
+        session.log.info({ deviceId: byId.id }, "device_id_resolved_by_devices_id");
+        return byId.id;
+      }
+    }
+
+    if (session.panelDeviceId && isUuid(session.panelDeviceId)) {
+      const { data: byPanel, error: err3 } = await supabase
+        .from("devices")
+        .select("id")
+        .eq("id", session.panelDeviceId)
+        .limit(1)
+        .maybeSingle();
+      if (err3) session.log.warn({ msg: err3.message }, "resolve_device_id_panel_hint_error");
+      if (byPanel?.id) {
+        session.panelDeviceId = byPanel.id;
+        session.log = session.log.child({ device_id: byPanel.id });
+        session.log.info({ deviceId: byPanel.id }, "device_id_resolved_by_connect_hint");
+        return byPanel.id;
+      }
+      session.log.warn(
+        { stale_panel_device_id: session.panelDeviceId, sessionId: session.id },
+        "panel_device_id_not_in_db_clearing"
+      );
+      session.panelDeviceId = null;
     }
   } catch (e) {
     session.log.warn({ err: String(e) }, "resolve_device_id_exception");
@@ -310,12 +372,20 @@ async function postWebhook(session, structuredPayload) {
     return;
   }
 
-  // The canonical session identifier sent to the panel must match devices.session_data.
-  // If the session was started by UUID (panelDeviceId === session.id), the panel still
-  // needs session_data in the payload so it can look up the row. We always send the
-  // human/slug sessionId (session.id as stored in this process) as `sessionId` and the
-  // UUID as `device_id` so the panel can correlate by either field.
+  session.panelDeviceId = deviceId;
+
+  // Canonical session key = Baileys session id (matches devices.session_data after bind).
   const canonicalSessionId = session.id;
+
+  session.log.info(
+    {
+      sessionId: canonicalSessionId,
+      panel_device_id: deviceId,
+      outgoing_webhook_device_id: deviceId,
+      event: structuredPayload.event,
+    },
+    "webhook_identity"
+  );
 
   let finalBody = {};
   let targetUrl = WEBHOOK_URL;
@@ -326,6 +396,7 @@ async function postWebhook(session, structuredPayload) {
       ...structuredPayload.payload,
       sessionId: canonicalSessionId,
       device_id: deviceId,
+      panel_device_id: deviceId,
     };
   } else if (structuredPayload.type === "connection") {
     // Session lifecycle events — always include device_id so the panel can
@@ -334,6 +405,7 @@ async function postWebhook(session, structuredPayload) {
     finalBody = {
       sessionId: canonicalSessionId,
       device_id: deviceId,
+      panel_device_id: deviceId,
       event: structuredPayload.event,
       meta: structuredPayload.payload || {},
       timestamp: Date.now(),
@@ -343,6 +415,7 @@ async function postWebhook(session, structuredPayload) {
     finalBody = {
       type: structuredPayload.type,
       device_id: deviceId,
+      panel_device_id: deviceId,
       sessionId: canonicalSessionId,
       event: structuredPayload.event,
       payload: structuredPayload.payload,
@@ -527,6 +600,7 @@ async function connectSession(sessionId, opts = {}) {
     s.panelDeviceId = opts.panelDeviceId;
     s.log = s.log.child({ device_id: opts.panelDeviceId });
     s.log.info({ deviceId: opts.panelDeviceId }, "device_id_from_connect_body");
+    await bindPanelDeviceToSession(s, opts.panelDeviceId);
   }
 
   if (connectingNow.has(id)) {
