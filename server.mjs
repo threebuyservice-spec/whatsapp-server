@@ -1,6 +1,7 @@
 import * as dotenv from "dotenv";
 dotenv.config();
 
+import { inspect } from "node:util";
 import express from "express";
 import fs from "fs/promises";
 import path from "path";
@@ -25,6 +26,10 @@ const AUTH_ROOT = path.resolve(process.env.AUTH_ROOT || "auth_info");
 const DEFAULT_SESSION_ID = sanitizeSessionId(process.env.DEFAULT_SESSION_ID || "default") || "default";
 // By default, only auto-start based on devices DB in production.
 const AUTO_START_DEFAULT = process.env.AUTO_START_DEFAULT === "true";
+/** Set WHATSAPP_DISABLE_AUTO_START_SAVED=1 to skip DB-driven session startup (debug / single-device tests). */
+const AUTO_START_SAVED_ENABLED = process.env.WHATSAPP_DISABLE_AUTO_START_SAVED !== "true";
+/** Set WHATSAPP_DEBUG_DISCONNECT=1 to log raw lastDisconnect once and stop reconnect for that process. */
+const DEBUG_DISCONNECT = process.env.WHATSAPP_DEBUG_DISCONNECT === "1";
 
 const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 3000);
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
@@ -90,6 +95,14 @@ const { webhookUrl: WEBHOOK_URL, sessionUrl: SESSION_WEBHOOK_URL } = normalizeWe
 );
 
 logger.info({ WEBHOOK_URL, SESSION_WEBHOOK_URL }, "webhook_urls_initialized");
+if (DEBUG_DISCONNECT) {
+  logger.warn(
+    "WHATSAPP_DEBUG_DISCONNECT=1: first close logs raw_last_disconnect; reconnect_blocked_debug_mode stops auto-reconnect"
+  );
+}
+if (!AUTO_START_SAVED_ENABLED) {
+  logger.info("WHATSAPP_DISABLE_AUTO_START_SAVED=1: auto_start_saved_sessions disabled");
+}
 
 const sessions = new Map();
 const connectingNow = new Set();
@@ -157,24 +170,21 @@ function normalizeDisconnect(lastDisconnect) {
     outputStatusCode,
     disconnectReasonCode: typeof rawDr === "number" ? rawDr : null,
     disconnectReasonName,
+    disconnect_parse_source: err != null ? "lastDisconnect.error" : "lastDisconnect_empty",
   };
 }
 
+/**
+ * Close Baileys socket without stripping event listeners or calling ws.close() with odd state
+ * (those paths have triggered Node "data must be string or Buffer" errors with Baileys 7).
+ */
 function cleanupBaileysSocket(session, sock) {
   if (!sock) return;
   try {
     if (typeof sock.end === "function") sock.end();
   } catch (e) {
-    session.log.debug({ err: String(e) }, "socket_end_failed");
+    session.log.debug({ err: safeErrorMessage(e) }, "socket_end_failed");
   }
-  try {
-    sock.ev?.removeAllListeners?.();
-  } catch (e) {
-    session.log.debug({ err: String(e) }, "socket_ev_removeListeners_failed");
-  }
-  try {
-    sock.ws?.close?.();
-  } catch {}
   if (session.boundSock === sock) session.boundSock = null;
   session.log.info({ sessionId: session.id }, "socket_cleanup_complete");
 }
@@ -585,6 +595,10 @@ function reconnectDelayMs(session) {
 }
 
 function scheduleReconnect(session, forceDelayMs = null) {
+  if (DEBUG_DISCONNECT) {
+    session.log.info("reconnect_skipped_debug_mode");
+    return;
+  }
   if (!session.shouldReconnect) return;
   clearReconnectTimer(session);
   session.status = "reconnecting";
@@ -843,6 +857,29 @@ async function connectSession(sessionId, opts = {}) {
       }
 
       if (connection === "close") {
+        if (DEBUG_DISCONNECT && !session._rawDisconnectLogged) {
+          session._rawDisconnectLogged = true;
+          try {
+            session.log.warn(
+              {
+                rawInspect: inspect(lastDisconnect, {
+                  depth: 10,
+                  maxStringLength: 12_000,
+                  breakLength: 100,
+                  compact: false,
+                }),
+                disconnect_parse_source: "util_inspect_lastDisconnect",
+              },
+              "raw_last_disconnect"
+            );
+          } catch (e) {
+            session.log.warn(
+              { err: safeErrorMessage(e) },
+              "raw_last_disconnect_inspect_failed"
+            );
+          }
+        }
+
         const norm = normalizeDisconnect(lastDisconnect);
         const statusCode = norm.statusCode;
         const reason = norm.reason;
@@ -866,6 +903,7 @@ async function connectSession(sessionId, opts = {}) {
             outputStatusCode: norm.outputStatusCode,
             disconnectReasonCode: norm.disconnectReasonCode,
             disconnectReasonName: norm.disconnectReasonName,
+            disconnect_parse_source: norm.disconnect_parse_source,
             reason,
             isStreamError,
             wasPairing,
@@ -912,6 +950,13 @@ async function connectSession(sessionId, opts = {}) {
             event: "error",
             payload: { statusCode, reason },
           });
+        }
+
+        if (DEBUG_DISCONNECT) {
+          session.shouldReconnect = false;
+          clearReconnectTimer(session);
+          session.log.warn({ sessionId: session.id }, "reconnect_blocked_debug_mode");
+          return;
         }
 
         // Longer delay for stream errors and pairing interruptions to let the
@@ -1108,6 +1153,7 @@ const server = app.listen(PORT, () => {
 });
 
 async function autoStartSavedSessions() {
+  if (!AUTO_START_SAVED_ENABLED) return;
   if (!supabase || !currentIsLeader()) return;
   try {
     const { data: devices, error } = await supabase
