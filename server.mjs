@@ -99,6 +99,11 @@ if (DEBUG_DISCONNECT) {
   logger.warn(
     "WHATSAPP_DEBUG_DISCONNECT=1: first close logs raw_last_disconnect; reconnect_blocked_debug_mode stops auto-reconnect"
   );
+  if (AUTO_START_SAVED_ENABLED) {
+    logger.warn(
+      "WHATSAPP_DEBUG_DISCONNECT=1: also set WHATSAPP_DISABLE_AUTO_START_SAVED=1 to skip DB auto-start noise"
+    );
+  }
 }
 if (!AUTO_START_SAVED_ENABLED) {
   logger.info("WHATSAPP_DISABLE_AUTO_START_SAVED=1: auto_start_saved_sessions disabled");
@@ -143,6 +148,46 @@ function safeErrorMessage(err) {
   } catch {
     return "unserializable_error";
   }
+}
+
+/**
+ * First-disconnect debug: only string/primitive fields (no raw error objects in log payload).
+ */
+function rawDisconnectDebugFields(lastDisconnect) {
+  const err = lastDisconnect?.error;
+  const rawInspect = inspect(lastDisconnect, {
+    depth: 10,
+    maxStringLength: 12_000,
+    breakLength: 120,
+    compact: false,
+  });
+  let raw_error_constructor_name = "n/a";
+  if (err != null && typeof err === "object" && err.constructor?.name) {
+    raw_error_constructor_name = String(err.constructor.name);
+  } else if (err == null) {
+    raw_error_constructor_name = "null";
+  } else {
+    raw_error_constructor_name = typeof err;
+  }
+  let raw_error_keys = "n/a";
+  if (err != null && typeof err === "object") {
+    try {
+      raw_error_keys = JSON.stringify(Object.keys(err).slice(0, 64));
+    } catch {
+      raw_error_keys = "keys_unavailable";
+    }
+  }
+  const raw_error_message_if_present =
+    typeof err?.message === "string" ? err.message.slice(0, 4000) : "";
+  const raw_error_stack_if_present =
+    typeof err?.stack === "string" ? err.stack.slice(0, 8000) : "";
+  return {
+    rawInspect,
+    raw_error_constructor_name,
+    raw_error_keys,
+    raw_error_message_if_present,
+    raw_error_stack_if_present,
+  };
 }
 
 /**
@@ -782,7 +827,7 @@ async function connectSession(sessionId, opts = {}) {
         await saveCreds();
         session.log.debug("creds_saved_success");
       } catch (err) {
-        session.log.error({ err: safeErrorMessage(err) }, "creds_save_failed");
+        session.log.error({ err: safeErrorMessage(err) }, "creds_save_failed_safe");
       }
     });
 
@@ -860,14 +905,15 @@ async function connectSession(sessionId, opts = {}) {
         if (DEBUG_DISCONNECT && !session._rawDisconnectLogged) {
           session._rawDisconnectLogged = true;
           try {
+            const raw = rawDisconnectDebugFields(lastDisconnect);
             session.log.warn(
               {
-                rawInspect: inspect(lastDisconnect, {
-                  depth: 10,
-                  maxStringLength: 12_000,
-                  breakLength: 100,
-                  compact: false,
-                }),
+                sessionId: session.id,
+                rawInspect: raw.rawInspect,
+                raw_error_constructor_name: raw.raw_error_constructor_name,
+                raw_error_keys: raw.raw_error_keys,
+                raw_error_message_if_present: raw.raw_error_message_if_present,
+                raw_error_stack_if_present: raw.raw_error_stack_if_present,
                 disconnect_parse_source: "util_inspect_lastDisconnect",
               },
               "raw_last_disconnect"
@@ -955,6 +1001,8 @@ async function connectSession(sessionId, opts = {}) {
         if (DEBUG_DISCONNECT) {
           session.shouldReconnect = false;
           clearReconnectTimer(session);
+          session.status = "error";
+          session.lastError = reason.slice(0, 500);
           session.log.warn({ sessionId: session.id }, "reconnect_blocked_debug_mode");
           return;
         }
