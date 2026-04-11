@@ -496,7 +496,7 @@ async function closeSession(session, { logout = false, removeAuth = false } = {}
       if (logout) await session.sock.logout();
     } catch {}
     try {
-      if (session.sock.end) session.sock.end(new Error("Session closed"));
+      if (session.sock.end) session.sock.end();
     } catch {}
   }
 
@@ -644,7 +644,7 @@ async function connectSession(sessionId, opts = {}) {
     if (session.sock) {
       session.log.info("ending_previous_socket");
       try {
-        session.sock.end(new Error("Restarting session"));
+        session.sock.end();
       } catch {}
       session.sock = null;
     }
