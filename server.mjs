@@ -115,6 +115,70 @@ function isUuid(s) {
   );
 }
 
+/** Boom, Error, or arbitrary value → safe string for logs / webhook payloads (never pass raw objects as socket data). */
+function safeErrorMessage(err) {
+  if (err == null) return "unknown";
+  if (typeof err === "string") return err.slice(0, 4000);
+  if (typeof err === "number" || typeof err === "boolean") return String(err);
+  if (typeof err?.message === "string" && err.message) return err.message.slice(0, 4000);
+  try {
+    const s = JSON.stringify(err);
+    if (s && s !== "{}") return s.slice(0, 2000);
+  } catch {}
+  try {
+    return String(err).slice(0, 2000);
+  } catch {
+    return "unserializable_error";
+  }
+}
+
+/**
+ * Normalize Baileys connection.update lastDisconnect (Boom, Error, plain object).
+ */
+function normalizeDisconnect(lastDisconnect) {
+  const err = lastDisconnect?.error;
+  const outputStatusCode =
+    err != null && typeof err === "object" && typeof err.output?.statusCode === "number"
+      ? err.output.statusCode
+      : null;
+  let statusCode = outputStatusCode;
+  if (statusCode == null && typeof err === "number") statusCode = err;
+
+  const rawDr = lastDisconnect?.disconnectReason;
+  let disconnectReasonName = null;
+  if (typeof rawDr === "number" && typeof DisconnectReason === "object" && DisconnectReason != null) {
+    disconnectReasonName =
+      Object.keys(DisconnectReason).find((k) => DisconnectReason[k] === rawDr) || null;
+  }
+
+  return {
+    reason: safeErrorMessage(err),
+    statusCode,
+    outputStatusCode,
+    disconnectReasonCode: typeof rawDr === "number" ? rawDr : null,
+    disconnectReasonName,
+  };
+}
+
+function cleanupBaileysSocket(session, sock) {
+  if (!sock) return;
+  try {
+    if (typeof sock.end === "function") sock.end();
+  } catch (e) {
+    session.log.debug({ err: String(e) }, "socket_end_failed");
+  }
+  try {
+    sock.ev?.removeAllListeners?.();
+  } catch (e) {
+    session.log.debug({ err: String(e) }, "socket_ev_removeListeners_failed");
+  }
+  try {
+    sock.ws?.close?.();
+  } catch {}
+  if (session.boundSock === sock) session.boundSock = null;
+  session.log.info({ sessionId: session.id }, "socket_cleanup_complete");
+}
+
 function getOrCreateSession(id) {
   if (!sessions.has(id)) {
     sessions.set(id, {
@@ -495,9 +559,7 @@ async function closeSession(session, { logout = false, removeAuth = false } = {}
     try {
       if (logout) await session.sock.logout();
     } catch {}
-    try {
-      if (session.sock.end) session.sock.end();
-    } catch {}
+    cleanupBaileysSocket(session, session.sock);
   }
 
   session.sock = null;
@@ -609,8 +671,9 @@ async function connectSession(sessionId, opts = {}) {
   }
 
   if (connectingNow.has(id)) {
-    logger.warn({ id }, "connect_skip_already_connecting");
-    return getOrCreateSession(id);
+    const s = getOrCreateSession(id);
+    s.log.info({ sessionId: id }, "reconnect_skipped_already_connecting");
+    return s;
   }
 
   const session = getOrCreateSession(id);
@@ -632,9 +695,10 @@ async function connectSession(sessionId, opts = {}) {
     }
   }
 
-  connectingNow.add(id);
+  let socketCreated = false;
 
   try {
+    connectingNow.add(id);
     session.shouldReconnect = true;
     session.lastError = null;
     session.lastQrSavedAt = 0;
@@ -643,9 +707,7 @@ async function connectSession(sessionId, opts = {}) {
 
     if (session.sock) {
       session.log.info("ending_previous_socket");
-      try {
-        session.sock.end();
-      } catch {}
+      cleanupBaileysSocket(session, session.sock);
       session.sock = null;
     }
 
@@ -688,9 +750,17 @@ async function connectSession(sessionId, opts = {}) {
     });
 
     session.sock = sock;
+    socketCreated = true;
     session.status = "connecting";
     session.qrDataUrl = null;
     session.updatedAt = nowIso();
+
+    const hangGuard = setTimeout(() => {
+      if (connectingNow.has(id) && session.sock === sock) {
+        connectingNow.delete(id);
+        session.log.warn({ sessionId: id }, "connecting_stale_timeout");
+      }
+    }, 180_000);
 
     sock.ev.on("creds.update", async () => {
       if (session.sock !== sock) return;
@@ -698,7 +768,7 @@ async function connectSession(sessionId, opts = {}) {
         await saveCreds();
         session.log.debug("creds_saved_success");
       } catch (err) {
-        session.log.error({ err: err.message }, "creds_save_failed");
+        session.log.error({ err: safeErrorMessage(err) }, "creds_save_failed");
       }
     });
 
@@ -706,6 +776,7 @@ async function connectSession(sessionId, opts = {}) {
 
     sock.ev.on("connection.update", async (update) => {
       if (session.sock !== sock) return;
+      clearTimeout(hangGuard);
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
@@ -728,6 +799,7 @@ async function connectSession(sessionId, opts = {}) {
       }
 
       if (connection === "open") {
+        connectingNow.delete(id);
         session.status = "connected";
         session.qrDataUrl = null;
         session.reconnectAttempts = 0;
@@ -735,10 +807,18 @@ async function connectSession(sessionId, opts = {}) {
         session.lastError = null;
         session.lastQrSavedAt = 0;
         session.updatedAt = nowIso();
-        session.log.info("connection_open");
 
         // Eagerly persist device_id so every subsequent webhook includes it.
         await resolvePanelDeviceId(session);
+
+        session.log.info(
+          {
+            sessionId: session.id,
+            panel_device_id: session.panelDeviceId,
+            connection: "open",
+          },
+          "connection_open"
+        );
 
         const phoneNumber =
           sock.user?.id?.split(":")[0]?.split("@")[0] || null;
@@ -763,9 +843,9 @@ async function connectSession(sessionId, opts = {}) {
       }
 
       if (connection === "close") {
-        const statusCode =
-          lastDisconnect?.error?.output?.statusCode ?? null;
-        const reason = lastDisconnect?.error?.message ?? "unknown";
+        const norm = normalizeDisconnect(lastDisconnect);
+        const statusCode = norm.statusCode;
+        const reason = norm.reason;
         session.lastDisconnectCode = statusCode;
         session.updatedAt = nowIso();
         session.sock = null;
@@ -778,14 +858,22 @@ async function connectSession(sessionId, opts = {}) {
 
         session.log.warn(
           {
-            statusCode,
-            reason,
+            sessionId: session.id,
+            panel_device_id: session.panelDeviceId,
+            connection: "close",
             currentStatus: session.status,
+            statusCode,
+            outputStatusCode: norm.outputStatusCode,
+            disconnectReasonCode: norm.disconnectReasonCode,
+            disconnectReasonName: norm.disconnectReasonName,
+            reason,
             isStreamError,
             wasPairing,
           },
-          "connection_close"
+          "connection_close_normalized"
         );
+
+        connectingNow.delete(id);
 
         if (statusCode === DisconnectReason.loggedOut) {
           session.status = "logged_out";
@@ -836,8 +924,11 @@ async function connectSession(sessionId, opts = {}) {
     });
 
     return session;
+  } catch (err) {
+    session.log.error({ err: safeErrorMessage(err) }, "connectSession_failed");
+    throw err;
   } finally {
-    connectingNow.delete(id);
+    if (!socketCreated) connectingNow.delete(id);
   }
 }
 
