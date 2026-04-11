@@ -261,7 +261,10 @@ async function resolvePanelDeviceId(session) {
         .eq("id", session.panelDeviceId)
         .limit(1)
         .maybeSingle();
-      if (err3) session.log.warn({ msg: err3.message }, "resolve_device_id_panel_hint_error");
+      if (err3) {
+        session.log.warn({ msg: err3.message }, "resolve_device_id_panel_hint_error");
+        return null;
+      }
       if (byPanel?.id) {
         session.panelDeviceId = byPanel.id;
         session.log = session.log.child({ device_id: byPanel.id });
@@ -531,7 +534,9 @@ function scheduleReconnect(session, forceDelayMs = null) {
   session.log.info({ delayMs: delay, attempt: session.reconnectAttempts }, "reconnect_scheduled");
 
   session.reconnectTimer = setTimeout(() => {
-    connectSession(session.id, {}).catch((err) => {
+    const panelDeviceId =
+      session.panelDeviceId && isUuid(session.panelDeviceId) ? session.panelDeviceId : undefined;
+    connectSession(session.id, panelDeviceId ? { panelDeviceId } : {}).catch((err) => {
       session.status = "error";
       session.lastError = err?.message || String(err);
       session.updatedAt = nowIso();
@@ -609,6 +614,12 @@ async function connectSession(sessionId, opts = {}) {
   }
 
   const session = getOrCreateSession(id);
+
+  // QR pairing / stream resets call connect again without a body; reaffirm session_data so
+  // lookups stay aligned (idempotent UPDATE).
+  if (!opts.panelDeviceId && session.panelDeviceId && isUuid(session.panelDeviceId)) {
+    await bindPanelDeviceToSession(session, session.panelDeviceId);
+  }
 
   if (
     !force &&
