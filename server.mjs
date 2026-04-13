@@ -630,6 +630,35 @@ function buildIncomingWebhookPayload(msg, { text, messageType, isGroup }) {
 }
 
 /**
+ * Outbound send: preserve full JIDs (e.g. …@lid, …@g.us). Legacy digit-only strings become …@s.whatsapp.net.
+ * Do not run global \\D stripping — that destroys @lid and breaks reply routing.
+ */
+function normalizeOutboundRecipient(raw) {
+  const s0 = String(raw ?? "").trim();
+  if (!s0) {
+    return { jid: "", outbound_to_kind: "invalid" };
+  }
+  if (!s0.includes("@")) {
+    const digits = s0.replace(/\D/g, "");
+    if (!digits) {
+      return { jid: "", outbound_to_kind: "invalid" };
+    }
+    const jid = `${digits}@s.whatsapp.net`;
+    return { jid, outbound_to_kind: "digits_legacy_pn" };
+  }
+  const at = s0.lastIndexOf("@");
+  const userRaw = s0.slice(0, at).trim();
+  const domain = s0.slice(at + 1).trim().toLowerCase();
+  const user = userRaw.replace(/^\+/, "");
+  const jid = `${user}@${domain}`;
+  let outbound_to_kind = "full_jid_other";
+  if (domain === "lid") outbound_to_kind = "lid";
+  else if (domain === "g.us") outbound_to_kind = "group";
+  else if (domain === "s.whatsapp.net" || domain === "c.us") outbound_to_kind = "pn";
+  return { jid, outbound_to_kind };
+}
+
+/**
  * Register messages.upsert once per live socket so reconnect gets a fresh listener.
  */
 function bindMessagesUpsert(session, sock) {
@@ -1215,8 +1244,21 @@ app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
   }
 
   try {
-    const cleanTo = String(to).replace(/\D/g, "");
-    const jid = `${cleanTo}@s.whatsapp.net`;
+    const normalized = normalizeOutboundRecipient(to);
+    if (!normalized.jid) {
+      return res.status(400).json({ error: "Invalid to / JID" });
+    }
+    const jid = normalized.jid;
+
+    session.log.info(
+      {
+        outbound_to_received: to,
+        outbound_to_kind: normalized.outbound_to_kind,
+        outbound_to_after_internal_normalization: jid,
+        final_sendMessage_jid: jid,
+      },
+      "outbound_send_precise"
+    );
 
     if (!session.sendQueue) session.sendQueue = Promise.resolve();
 
@@ -1237,7 +1279,7 @@ app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
 
     await session.sendQueue;
 
-    session.log.info({ to: cleanTo }, "send_ok");
+    session.log.info({ jid }, "send_ok");
     res.json({ success: true, status: "sent" });
   } catch (err) {
     session.log.error({ err: err?.message }, "send_error");
@@ -1254,12 +1296,28 @@ app.get("/send", requireApiAuth, async (req, res) => {
     if (!session || session.status !== "connected" || !session.sock) {
       return res.json({ status: false, message: "Device not connected" });
     }
-    
+
+    const normalized = normalizeOutboundRecipient(to);
+    if (!normalized.jid) {
+      return res.json({ status: false, message: "Invalid to / JID" });
+    }
+    const jid = normalized.jid;
+
+    session.log.info(
+      {
+        outbound_to_received: to,
+        outbound_to_kind: normalized.outbound_to_kind,
+        outbound_to_after_internal_normalization: jid,
+        final_sendMessage_jid: jid,
+      },
+      "outbound_send_precise"
+    );
+
     if (!session.sendQueue) session.sendQueue = Promise.resolve();
-    
+
     session.sendQueue = session.sendQueue
       .then(() => new Promise((r) => setTimeout(r, 1000)))
-      .then(() => session.sock.sendMessage(`${String(to).replace(/\D/g, "")}@s.whatsapp.net`, { text: message }));
+      .then(() => session.sock.sendMessage(jid, { text: message }));
 
     await session.sendQueue;
     res.json({ status: true });
