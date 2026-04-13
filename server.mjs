@@ -13,6 +13,7 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
 } from "@whiskeysockets/baileys";
+import { getChatId } from "@whiskeysockets/baileys/lib/Utils/process-message.js";
 import { useSupabaseAuthState } from "./lib/useSupabaseAuthState.mjs";
 import { logger, childLogger, createBaileysLogger } from "./lib/logger.mjs";
 import { createQueue, redisConnection } from "./lib/queues.mjs";
@@ -563,6 +564,71 @@ async function postIncomingWebhook(session, payload) {
   });
 }
 
+/** Serialize Baileys IMessageKey for JSON / panel BFF (strings only). */
+function serializeMessageKeyPlain(key) {
+  if (!key || typeof key !== "object") return {};
+  const out = {};
+  for (const name of [
+    "id",
+    "remoteJid",
+    "participant",
+    "participantAlt",
+    "remoteJidAlt",
+    "participantLid",
+    "senderLid",
+    "senderPn",
+  ]) {
+    const v = key[name];
+    if (v != null && v !== "") out[name] = String(v);
+  }
+  if (typeof key.fromMe === "boolean") out.fromMe = key.fromMe;
+  return out;
+}
+
+function digitsFromWaJid(jid) {
+  if (!jid || typeof jid !== "string") return "";
+  const user = jid.split("@")[0];
+  return user.split(":")[0].replace(/\D/g, "");
+}
+
+/** Full inbound identity for panel reply routing (preserves JIDs; legacy `from` = digits). */
+function buildIncomingWebhookPayload(msg, { text, messageType, isGroup }) {
+  const keyPlain = serializeMessageKeyPlain(msg.key);
+  const chatId = getChatId({
+    remoteJid: msg.key?.remoteJid,
+    participant: msg.key?.participant,
+    fromMe: msg.key?.fromMe,
+  });
+  const senderJid = isGroup ? msg.key?.participant || "" : msg.key?.remoteJid || "";
+  const legacyFrom = digitsFromWaJid(senderJid || chatId || msg.key?.remoteJid);
+
+  return {
+    from: legacyFrom,
+    text,
+    message_type: messageType,
+    is_group: isGroup,
+    key: keyPlain,
+    message: { key: { ...keyPlain } },
+    pushName: msg.pushName != null ? String(msg.pushName) : "",
+    fromMe: Boolean(msg.key?.fromMe),
+    chat_id: chatId ? String(chatId) : "",
+    sender_jid: senderJid ? String(senderJid) : "",
+    conversation_jid: msg.key?.remoteJid ? String(msg.key.remoteJid) : "",
+    raw_remote_jid: msg.key?.remoteJid ? String(msg.key.remoteJid) : "",
+    raw_participant_jid: msg.key?.participant ? String(msg.key.participant) : "",
+    reply_target_jid: chatId ? String(chatId) : "",
+    key_id: keyPlain.id || "",
+    key_remoteJid: keyPlain.remoteJid || "",
+    key_participant: keyPlain.participant || "",
+    key_participantAlt: keyPlain.participantAlt || "",
+    key_remoteJidAlt: keyPlain.remoteJidAlt || "",
+    message_key_id: keyPlain.id || "",
+    message_key_remoteJid: keyPlain.remoteJid || "",
+    message_key_participant: keyPlain.participant || "",
+    message_key_fromMe: typeof keyPlain.fromMe === "boolean" ? keyPlain.fromMe : false,
+  };
+}
+
 /**
  * Register messages.upsert once per live socket so reconnect gets a fresh listener.
  */
@@ -590,14 +656,33 @@ function bindMessagesUpsert(session, sock) {
       else if (msg.message.audioMessage) messageType = "audio";
       else if (msg.message.videoMessage) messageType = "video";
 
-      const phone = msg.key.remoteJid.split("@")[0];
-
-      await postIncomingWebhook(session, {
-        from: phone,
+      const payload = buildIncomingWebhookPayload(msg, {
         text,
-        message_type: messageType,
-        is_group: isGroup,
+        messageType,
+        isGroup,
       });
+
+      session.log.info(
+        {
+          sessionId: session.id,
+          chat_id: payload.chat_id,
+          reply_target_jid: payload.reply_target_jid,
+          key_remoteJid: payload.key_remoteJid,
+          sender_jid: payload.sender_jid,
+          from_digits_legacy: payload.from,
+          has_full_remote_jid: Boolean(payload.key_remoteJid),
+        },
+        "webhook_inbound_identity_snapshot"
+      );
+
+      if (!payload.key_remoteJid) {
+        session.log.warn(
+          { sessionId: session.id, from_digits_legacy: payload.from },
+          "webhook_inbound_identity_low_confidence"
+        );
+      }
+
+      await postIncomingWebhook(session, payload);
     }
   };
 
