@@ -120,6 +120,11 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+/** Panel/Supabase `devices` row timestamp — must match DB column (usually `updated_at`). */
+function devicesUpdatedPayload() {
+  return { updated_at: nowIso() };
+}
+
 function sanitizeSessionId(input) {
   if (typeof input !== "string") return null;
   const id = input.trim().toLowerCase();
@@ -286,7 +291,7 @@ async function updateSupabaseDevice(sessionId, data) {
   if (!supabase) return;
   const session = sessions.get(sessionId);
   try {
-    let query = supabase.from("devices").update({ ...data, updated_date: nowIso() });
+    let query = supabase.from("devices").update({ ...data, ...devicesUpdatedPayload() });
     if (session?.panelDeviceId && isUuid(session.panelDeviceId)) {
       query = query.eq("id", session.panelDeviceId);
     } else if (isUuid(sessionId)) {
@@ -296,7 +301,16 @@ async function updateSupabaseDevice(sessionId, data) {
     }
     const { error } = await query;
     if (error) {
-      session?.log?.warn({ msg: error.message }, "devices_db_update_error");
+      session?.log?.warn(
+        {
+          msg: error.message,
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+          devices_column: "updated_at",
+        },
+        "devices_db_update_error"
+      );
     } else {
       session?.log?.info(
         { kind: data.qr_code ? "qr" : data.status || "status" },
@@ -318,10 +332,19 @@ async function bindPanelDeviceToSession(session, panelDeviceId) {
   try {
     const { error } = await supabase
       .from("devices")
-      .update({ session_data: session.id, updated_date: nowIso() })
+      .update({ session_data: session.id, ...devicesUpdatedPayload() })
       .eq("id", panelDeviceId);
     if (error) {
-      session.log.warn({ msg: error.message, panelDeviceId }, "bind_panel_device_session_data_failed");
+      session.log.warn(
+        {
+          msg: error.message,
+          code: error.code,
+          details: error.details,
+          panelDeviceId,
+          devices_column: "updated_at",
+        },
+        "bind_panel_device_session_data_failed"
+      );
       return;
     }
     session.panelDeviceId = panelDeviceId;
@@ -633,6 +656,19 @@ function buildIncomingWebhookPayload(msg, { text, messageType, isGroup }) {
  * Outbound send: preserve full JIDs (e.g. …@lid, …@g.us). Legacy digit-only strings become …@s.whatsapp.net.
  * Do not run global \\D stripping — that destroys @lid and breaks reply routing.
  */
+/** Map Baileys/sendMessage failures to actionable categories for logs and clients. */
+function classifyOutboundSendError(err) {
+  const msg = safeErrorMessage(err).toLowerCase();
+  if (!msg || msg === "unknown") return "unknown";
+  if (msg.includes("not-authorized") || msg.includes("401") || msg.includes("logged out"))
+    return "session_auth_invalid";
+  if (msg.includes("connection") && (msg.includes("closed") || msg.includes("lost")))
+    return "socket_not_connected";
+  if (msg.includes("timeout") || msg.includes("timed out")) return "timeout";
+  if (msg.includes("conflict") || msg.includes("stream")) return "stream_conflict";
+  return "send_failed_other";
+}
+
 function normalizeOutboundRecipient(raw) {
   const s0 = String(raw ?? "").trim();
   if (!s0) {
@@ -941,7 +977,16 @@ async function connectSession(sessionId, opts = {}) {
         await saveCreds();
         session.log.debug("creds_saved_success");
       } catch (err) {
-        session.log.error({ err: safeErrorMessage(err) }, "creds_save_failed_safe");
+        session.log.error(
+          {
+            err: safeErrorMessage(err),
+            table: "whatsapp_baileys_auth",
+            phase: "saveCreds",
+            hint:
+              "Check RLS, service role key, and that columns match whatsapp_baileys_auth (session_id, file_key, value, updated_at).",
+          },
+          "creds_save_failed_safe"
+        );
       }
     });
 
@@ -953,21 +998,8 @@ async function connectSession(sessionId, opts = {}) {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        // Debounce: suppress new QRs when already connected or freshly in the
-        // QR handshake window (status is "qr_pending") to avoid
-        // overwriting a pairing in progress.
-        const now = Date.now();
-        const stateAge = now - new Date(session.updatedAt || 0).getTime();
-        const inHandshake =
-          session.status === "qr_pending" ||
-          session.status === "connected";
-        if (inHandshake && stateAge < QR_THROTTLE_MS) {
-          session.log.debug(
-            { status: session.status, stateAge },
-            "qr_ignored_during_handshake"
-          );
-          return;
-        }
+        // Always route QR through handleQR so session.qrDataUrl stays fresh when Baileys
+        // rotates the code. DB/webhook writes inside handleQR remain throttled (QR_THROTTLE_MS).
         await handleQR(session, qr);
       }
 
@@ -1162,7 +1194,17 @@ app.get("/sessions/:sessionId/qr/image", requireApiAuth, (req, res) => {
   const id = sanitizeSessionId(req.params.sessionId);
   if (!id) return res.status(400).send("Invalid ID");
   const session = sessions.get(id);
-  if (!session || !session.qrDataUrl) return res.status(404).send("QR not ready");
+  if (!session || !session.qrDataUrl) {
+    const log = session?.log || logger.child({ sessionId: id });
+    log.debug(
+      {
+        reason: !session ? "no_in_memory_session" : "qr_data_url_empty",
+        status: session?.status,
+      },
+      "qr_image_unavailable"
+    );
+    return res.status(404).send("QR not ready");
+  }
 
   try {
     const base64Data = session.qrDataUrl.replace(/^data:image\/\w+;base64,/, "");
@@ -1282,8 +1324,17 @@ app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
     session.log.info({ jid }, "send_ok");
     res.json({ success: true, status: "sent" });
   } catch (err) {
-    session.log.error({ err: err?.message }, "send_error");
-    res.status(500).json({ error: err.message });
+    const kind = classifyOutboundSendError(err);
+    session.log.error(
+      {
+        err: err?.message,
+        send_error_kind: kind,
+        session_status: session.status,
+        has_socket: Boolean(session.sock),
+      },
+      "send_error"
+    );
+    res.status(500).json({ error: err.message, kind });
   }
 });
 
