@@ -131,9 +131,22 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-/** Panel/Supabase `devices` row timestamp — must match DB column (usually `updated_at`). */
+/**
+ * Supabase `devices` row timestamp payload.
+ *
+ * Historical drift: the panel schema used `updated_date`, the server uses
+ * `updated_at`. After `supabase_system_fix.sql` both columns exist and are
+ * kept in sync via trigger, but we *write* both so that:
+ *   (a) the server still works on partially-migrated environments, and
+ *   (b) PostgREST does not throw schema-cache errors for either column.
+ *
+ * `stripUnknownColumnsFromDeviceRow` below then removes any column the
+ * server-observed schema cache reports as missing, so updates degrade
+ * gracefully rather than failing the whole row.
+ */
 function devicesUpdatedPayload() {
-  return { updated_at: nowIso() };
+  const n = nowIso();
+  return { updated_at: n, updated_date: n };
 }
 
 function sanitizeSessionId(input) {
@@ -352,6 +365,14 @@ function isSessionSendReady(session) {
   if (!session.sock.user?.id && !session.sock.user?.jid) {
     return { ok: false, reason: "no_baileys_user" };
   }
+  // Crypto/auth persistence health: if credentials could not be saved in the
+  // last 60s, the session is almost always in a degraded state (trigger/schema
+  // drift, Supabase outage, etc.). Refuse to declare it send-ready so queue
+  // workers skip sends instead of burning retries on a broken session.
+  const lastCredsFail = Number(session.credsSaveFailedAt || 0);
+  if (lastCredsFail && Date.now() - lastCredsFail < 60_000) {
+    return { ok: false, reason: "creds_save_degraded" };
+  }
   return { ok: true, reason: "ready" };
 }
 
@@ -375,40 +396,91 @@ function clearReconnectTimer(session) {
   session.reconnectTimer = null;
 }
 
+/**
+ * Process-wide cache of columns PostgREST has reported as missing from the
+ * `devices` schema cache. We drop those keys on subsequent updates so a single
+ * migration-drift column does not poison every device update.
+ */
+const _devicesMissingColumns = new Set();
+
+function _extractMissingColumnFromPgrstError(err) {
+  if (!err) return null;
+  const msg = String(err.message || err.details || "").toLowerCase();
+  // PGRST204 / schema-cache errors look like: "Could not find the 'foo'
+  // column of 'devices' in the schema cache"
+  const m = msg.match(/could not find the ['\"]([a-z0-9_]+)['\"] column of ['\"]devices['\"]/i);
+  if (m) return m[1];
+  // Postgres undefined_column (42703): 'column "foo" of relation "devices" does not exist'
+  const m2 = msg.match(/column ['\"]([a-z0-9_]+)['\"] of relation ['\"]devices['\"] does not exist/i);
+  if (m2) return m2[1];
+  return null;
+}
+
+function _stripKnownMissingColumns(row) {
+  if (!row || _devicesMissingColumns.size === 0) return row;
+  const out = { ...row };
+  for (const k of _devicesMissingColumns) delete out[k];
+  return out;
+}
+
 async function updateSupabaseDevice(sessionId, data) {
   if (!supabase) return;
   const session = sessions.get(sessionId);
-  try {
-    let query = supabase.from("devices").update({ ...data, ...devicesUpdatedPayload() });
-    if (session?.panelDeviceId && isUuid(session.panelDeviceId)) {
-      query = query.eq("id", session.panelDeviceId);
-    } else if (isUuid(sessionId)) {
-      query = query.eq("id", sessionId);
-    } else {
-      query = query.eq("session_data", sessionId);
+
+  const applyFilter = (q) => {
+    if (session?.panelDeviceId && isUuid(session.panelDeviceId)) return q.eq("id", session.panelDeviceId);
+    if (isUuid(sessionId)) return q.eq("id", sessionId);
+    return q.eq("session_data", sessionId);
+  };
+
+  // Try once with the full payload, then retry (up to 3 times) dropping
+  // columns that the schema cache rejects. This turns a partial-migration
+  // environment from "every update fails" into "update succeeds for known
+  // columns", and self-heals after `supabase_system_fix.sql` is applied.
+  const fullRow = { ...data, ...devicesUpdatedPayload() };
+  let attempt = 0;
+  let lastError = null;
+  while (attempt < 4) {
+    const row = _stripKnownMissingColumns(fullRow);
+    if (Object.keys(row).length === 0) {
+      session?.log?.warn({ data_keys: Object.keys(fullRow) }, "devices_db_update_noop_all_columns_missing");
+      return;
     }
-    const { error } = await query;
-    if (error) {
+    try {
+      const { error } = await applyFilter(supabase.from("devices").update(row));
+      if (!error) {
+        session?.log?.info(
+          { kind: data.qr_code ? "qr" : data.status || "status", attempt },
+          "devices_db_updated"
+        );
+        return;
+      }
+      lastError = error;
+      const missing = _extractMissingColumnFromPgrstError(error);
+      if (missing && !_devicesMissingColumns.has(missing)) {
+        _devicesMissingColumns.add(missing);
+        session?.log?.warn(
+          { missing_column: missing, code: error.code, advice: "run supabase_system_fix.sql" },
+          "devices_db_column_missing_will_retry"
+        );
+        attempt++;
+        continue;
+      }
       session?.log?.warn(
-        {
-          msg: error.message,
-          code: error.code,
-          details: error.details,
-          hint: error.hint,
-          devices_column: "updated_at",
-        },
+        { msg: error.message, code: error.code, details: error.details, hint: error.hint },
         "devices_db_update_error"
       );
-    } else {
-      session?.log?.info(
-        { kind: data.qr_code ? "qr" : data.status || "status" },
-        "devices_db_updated"
-      );
+      return;
+    } catch (err) {
+      lastError = err;
+      session?.log?.warn({ err: String(err), attempt }, "devices_db_update_exception");
+      return;
     }
-  } catch (err) {
-    const session = sessions.get(sessionId);
-    session?.log?.warn({ err: String(err) }, "devices_db_update_exception");
   }
+  session?.log?.warn(
+    { err: String(lastError?.message || lastError), missing_cols: [..._devicesMissingColumns] },
+    "devices_db_update_exhausted"
+  );
 }
 
 /**
@@ -1089,15 +1161,23 @@ async function connectSession(sessionId, opts = {}) {
       if (session.sock !== sock) return;
       try {
         await saveCreds();
+        session.credsSaveFailedAt = 0;
+        session.credsSaveFailStreak = 0;
         session.log.debug("creds_saved_success");
       } catch (err) {
+        // Stamp failure timestamp so isSessionSendReady() downgrades this
+        // session — keeps queue workers from firing sends while the auth
+        // layer is actually broken (trigger drift, Supabase outage, etc).
+        session.credsSaveFailedAt = Date.now();
+        session.credsSaveFailStreak = (session.credsSaveFailStreak || 0) + 1;
         session.log.error(
           {
             err: safeErrorMessage(err),
             table: "whatsapp_baileys_auth",
             phase: "saveCreds",
+            fail_streak: session.credsSaveFailStreak,
             hint:
-              "Check RLS, service role key, and that columns match whatsapp_baileys_auth (session_id, file_key, value, updated_at).",
+              "Run supabase_system_fix.sql (updated_date trigger was firing on whatsapp_baileys_auth which has no such column). Also verify service role key and RLS.",
           },
           "creds_save_failed_safe"
         );
