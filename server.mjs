@@ -18,6 +18,11 @@ import { useSupabaseAuthState } from "./lib/useSupabaseAuthState.mjs";
 import { logger, childLogger, createBaileysLogger } from "./lib/logger.mjs";
 import { createQueue, redisConnection } from "./lib/queues.mjs";
 import { initLeaderElection, currentIsLeader } from "./lib/leader.mjs";
+import {
+  tryAcquireSessionOwnerLock,
+  releaseSessionOwnerLock,
+  renewSessionOwnerLock,
+} from "./lib/sessionRedisLock.mjs";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -35,6 +40,12 @@ const DEBUG_DISCONNECT = process.env.WHATSAPP_DEBUG_DISCONNECT === "1";
 const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 3000);
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
 const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 15_000);
+/** When Redis is set, require exclusive session ownership (multi-replica Railway). Set WA_SESSION_REDIS_LOCK=false to disable. */
+const WA_SESSION_REDIS_LOCK = process.env.WA_SESSION_REDIS_LOCK !== "false";
+/** Optional pinned Baileys web version JSON, e.g. [2,3000,0] — avoids fetch/version drift vs stored keys. */
+const BAILEYS_VERSION_JSON = process.env.BAILEYS_VERSION_JSON || "";
+/** Set DEVICES_EXTENDED_FIELDS=false if `devices` has no whatsapp_jid / last_connected_at yet. */
+const DEVICES_EXTENDED_FIELDS = process.env.DEVICES_EXTENDED_FIELDS !== "false";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY =
@@ -261,6 +272,16 @@ function getOrCreateSession(id) {
       panelDeviceId: null,
       /** bound socket for messages.upsert */
       boundSock: null,
+      /** @type {ReturnType<typeof setInterval> | null} */
+      ownerLockRenewInterval: null,
+      /** @type {string | null} */
+      linkedPhone: null,
+      /** @type {string | null} */
+      linkedName: null,
+      /** @type {string | null} */
+      linkedWaJid: null,
+      /** @type {string | null} */
+      connectionOpenedAt: null,
     });
   }
   return sessions.get(id);
@@ -272,6 +293,18 @@ async function resolveAuthDir(sessionId) {
 
 async function getBaileysVersion() {
   if (cachedBaileysVersion) return cachedBaileysVersion;
+  if (BAILEYS_VERSION_JSON.trim()) {
+    try {
+      const parsed = JSON.parse(BAILEYS_VERSION_JSON);
+      if (Array.isArray(parsed) && parsed.length >= 1) {
+        cachedBaileysVersion = parsed;
+        logger.info({ version: cachedBaileysVersion }, "baileys_version_pinned_from_env");
+        return cachedBaileysVersion;
+      }
+    } catch (e) {
+      logger.warn({ err: String(e) }, "BAILEYS_VERSION_JSON_invalid");
+    }
+  }
   try {
     const { version } = await fetchLatestBaileysVersion();
     cachedBaileysVersion = version;
@@ -280,6 +313,61 @@ async function getBaileysVersion() {
     logger.warn({ err: String(e) }, "fetchLatestBaileysVersion_failed");
     return undefined;
   }
+}
+
+/**
+ * Linked WhatsApp account from Baileys sock.user (PN vs LID — prefer digits when present).
+ */
+function extractLinkedWaAccount(sock) {
+  const u = sock?.user;
+  if (!u) {
+    return { phoneNumber: null, profileName: null, waJid: null };
+  }
+  const rawId = u.id != null ? String(u.id) : u.jid != null ? String(u.jid) : "";
+  const waJid = rawId || null;
+  let phoneNumber = null;
+  if (waJid && waJid.includes("@")) {
+    const userPart = waJid.split("@")[0];
+    const head = userPart.includes(":") ? userPart.split(":")[0] : userPart;
+    const digits = head.replace(/\D/g, "");
+    if (digits.length >= 8 && digits.length <= 15) phoneNumber = digits;
+  }
+  const profileName =
+    (typeof u.name === "string" && u.name.trim()) ||
+    (typeof u.verifiedName === "string" && u.verifiedName.trim()) ||
+    (typeof u.notify === "string" && u.notify.trim()) ||
+    phoneNumber ||
+    null;
+  return { phoneNumber, profileName, waJid };
+}
+
+/** True “can send” — not only status === connected (avoids false positives right after open). */
+function isSessionSendReady(session) {
+  if (!session?.sock) return { ok: false, reason: "no_socket" };
+  if (session.status !== "connected") return { ok: false, reason: `status_${session.status}` };
+  const ws = session.sock.ws;
+  if (ws && typeof ws.readyState === "number" && ws.readyState !== 1) {
+    return { ok: false, reason: `ws_readyState_${ws.readyState}` };
+  }
+  if (!session.sock.user?.id && !session.sock.user?.jid) {
+    return { ok: false, reason: "no_baileys_user" };
+  }
+  return { ok: true, reason: "ready" };
+}
+
+function clearSessionOwnerLockRenewal(session) {
+  if (session.ownerLockRenewInterval) {
+    clearInterval(session.ownerLockRenewInterval);
+    session.ownerLockRenewInterval = null;
+  }
+}
+
+function startSessionOwnerLockRenewal(session) {
+  if (!redisConnection || !WA_SESSION_REDIS_LOCK) return;
+  clearSessionOwnerLockRenewal(session);
+  session.ownerLockRenewInterval = setInterval(() => {
+    renewSessionOwnerLock(session.id).catch(() => {});
+  }, 60_000);
 }
 
 function clearReconnectTimer(session) {
@@ -660,8 +748,12 @@ function buildIncomingWebhookPayload(msg, { text, messageType, isGroup }) {
 function classifyOutboundSendError(err) {
   const msg = safeErrorMessage(err).toLowerCase();
   if (!msg || msg === "unknown") return "unknown";
+  if (msg.includes("bad mac") || msg.includes("badmac") || msg.includes("decrypt"))
+    return "crypto_session_degraded";
   if (msg.includes("not-authorized") || msg.includes("401") || msg.includes("logged out"))
     return "session_auth_invalid";
+  if (msg.includes("not registered") || msg.includes("not on whatsapp"))
+    return "recipient_invalid";
   if (msg.includes("connection") && (msg.includes("closed") || msg.includes("lost")))
     return "socket_not_connected";
   if (msg.includes("timeout") || msg.includes("timed out")) return "timeout";
@@ -759,6 +851,8 @@ function bindMessagesUpsert(session, sock) {
 async function closeSession(session, { logout = false, removeAuth = false } = {}) {
   session.shouldReconnect = false;
   clearReconnectTimer(session);
+  clearSessionOwnerLockRenewal(session);
+  await releaseSessionOwnerLock(session.id);
 
   if (session.sock) {
     try {
@@ -908,6 +1002,21 @@ async function connectSession(sessionId, opts = {}) {
 
   try {
     connectingNow.add(id);
+    if (redisConnection && WA_SESSION_REDIS_LOCK) {
+      const lock = await tryAcquireSessionOwnerLock(id);
+      if (!lock.acquired) {
+        connectingNow.delete(id);
+        throw new Error(
+          `Session is owned by another instance (Redis lock holder: ${lock.owner}). Use a single active replica or wait for release.`
+        );
+      }
+      if (!lock.failOpen) {
+        session.log.info(
+          { reentrant: lock.reentrant === true },
+          "session_owner_lock_acquired"
+        );
+      }
+    }
     session.shouldReconnect = true;
     session.lastError = null;
     session.lastQrSavedAt = 0;
@@ -967,7 +1076,12 @@ async function connectSession(sessionId, opts = {}) {
     const hangGuard = setTimeout(() => {
       if (connectingNow.has(id) && session.sock === sock) {
         connectingNow.delete(id);
-        session.log.warn({ sessionId: id }, "connecting_stale_timeout");
+        clearSessionOwnerLockRenewal(session);
+        releaseSessionOwnerLock(id).catch(() => {});
+        session.log.warn(
+          { sessionId: id, status: session.status },
+          "connecting_stale_timeout_releasing_lock"
+        );
       }
     }, 180_000);
 
@@ -1025,25 +1139,51 @@ async function connectSession(sessionId, opts = {}) {
           "connection_open"
         );
 
-        const phoneNumber =
-          sock.user?.id?.split(":")[0]?.split("@")[0] || null;
-        const profileName =
-          sock.user?.name ||
-          sock.user?.verifiedName ||
-          phoneNumber ||
-          "WhatsApp Device";
+        startSessionOwnerLockRenewal(session);
 
-        await updateSupabaseDevice(id, {
+        const linked = extractLinkedWaAccount(sock);
+        session.linkedPhone = linked.phoneNumber;
+        session.linkedName = linked.profileName;
+        session.linkedWaJid = linked.waJid;
+        session.connectionOpenedAt = nowIso();
+
+        session.log.info(
+          {
+            linked_phone: linked.phoneNumber,
+            linked_wa_jid: linked.waJid,
+            linked_profile_name: linked.profileName,
+          },
+          "session_linked_account_metadata"
+        );
+
+        const phoneNumber = linked.phoneNumber;
+        const profileName = linked.profileName || "WhatsApp Device";
+
+        const baseDeviceRow = {
           status: "connected",
           phone_number: phoneNumber,
           name: profileName,
           qr_code: null,
-        });
+        };
+        if (DEVICES_EXTENDED_FIELDS) {
+          Object.assign(baseDeviceRow, {
+            whatsapp_jid: linked.waJid,
+            last_connected_at: session.connectionOpenedAt,
+          });
+        }
+        await updateSupabaseDevice(id, baseDeviceRow);
 
         await postWebhook(session, {
           type: "connection",
           event: "connected",
-          payload: { phone_number: phoneNumber, name: profileName },
+          payload: {
+            phone_number: phoneNumber,
+            name: profileName,
+            whatsapp_jid: linked.waJid,
+            wa_jid: linked.waJid,
+            connected_at: Date.now(),
+            last_connected_at: session.connectionOpenedAt,
+          },
         });
       }
 
@@ -1106,6 +1246,8 @@ async function connectSession(sessionId, opts = {}) {
         connectingNow.delete(id);
 
         if (statusCode === DisconnectReason.loggedOut) {
+          clearSessionOwnerLockRenewal(session);
+          await releaseSessionOwnerLock(session.id);
           session.status = "logged_out";
           session.shouldReconnect = false;
           session.qrDataUrl = null;
@@ -1167,7 +1309,11 @@ async function connectSession(sessionId, opts = {}) {
     session.log.error({ err: safeErrorMessage(err) }, "connectSession_failed");
     throw err;
   } finally {
-    if (!socketCreated) connectingNow.delete(id);
+    if (!socketCreated) {
+      connectingNow.delete(id);
+      clearSessionOwnerLockRenewal(session);
+      await releaseSessionOwnerLock(id);
+    }
   }
 }
 
@@ -1261,13 +1407,21 @@ app.get("/sessions/:sessionId/status", requireApiAuth, (req, res) => {
   const session = sessions.get(id);
   if (!session) return res.status(404).json({ status: "disconnected", connected: false });
 
+  const sendReady = isSessionSendReady(session);
   res.json({
     status: session.status,
     connected: session.status === "connected",
+    /** True only when socket + WS + Baileys user are ready (stricter than `connected` alone). */
+    sessionReady: sendReady.ok,
+    sessionReadyReason: sendReady.reason,
     qr: Boolean(session.qrDataUrl),
     updatedAt: session.updatedAt,
     panelDeviceId: session.panelDeviceId || null,
     reconnectAttempts: session.reconnectAttempts,
+    phone_number: session.linkedPhone,
+    name: session.linkedName,
+    whatsapp_jid: session.linkedWaJid,
+    connectionOpenedAt: session.connectionOpenedAt,
   });
 });
 
@@ -1281,8 +1435,13 @@ app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
   }
 
   const session = sessions.get(id);
-  if (!session || session.status !== "connected" || !session.sock) {
-    return res.status(400).json({ error: "Device not connected" });
+  const sendReady = isSessionSendReady(session);
+  if (!sendReady.ok) {
+    return res.status(400).json({
+      error: "Device not ready to send",
+      reason: sendReady.reason,
+      status: session?.status,
+    });
   }
 
   try {
@@ -1321,7 +1480,7 @@ app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
 
     await session.sendQueue;
 
-    session.log.info({ jid }, "send_ok");
+    session.log.info({ jid, send_ready_reason: sendReady.reason }, "send_ok");
     res.json({ success: true, status: "sent" });
   } catch (err) {
     const kind = classifyOutboundSendError(err);
@@ -1331,6 +1490,7 @@ app.post("/sessions/:sessionId/send", requireApiAuth, async (req, res) => {
         send_error_kind: kind,
         session_status: session.status,
         has_socket: Boolean(session.sock),
+        send_ready_snapshot: isSessionSendReady(session),
       },
       "send_error"
     );
@@ -1344,8 +1504,9 @@ app.get("/send", requireApiAuth, async (req, res) => {
   if (!to || !message || !targetId) return res.json({ status: false, message: "Missing required fields" });
   try {
     const session = sessions.get(targetId);
-    if (!session || session.status !== "connected" || !session.sock) {
-      return res.json({ status: false, message: "Device not connected" });
+    const sendReady = isSessionSendReady(session);
+    if (!sendReady.ok) {
+      return res.json({ status: false, message: "Device not ready to send", reason: sendReady.reason });
     }
 
     const normalized = normalizeOutboundRecipient(to);
@@ -1386,6 +1547,7 @@ app.get("/health", (_req, res) => {
       id: s.id,
       status: s.status,
       panelDeviceId: s.panelDeviceId || null,
+      sessionReady: isSessionSendReady(s).ok,
     })),
   });
 });

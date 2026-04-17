@@ -12,6 +12,11 @@
 --   phone_number text (nullable)
 --   name text (nullable)
 --   updated_at timestamptz
+--   whatsapp_jid text (nullable; full WA user id, e.g. 123...@s.whatsapp.net)
+--   last_connected_at timestamptz (nullable; last successful Baileys open)
+
+ALTER TABLE public.devices ADD COLUMN IF NOT EXISTS whatsapp_jid text;
+ALTER TABLE public.devices ADD COLUMN IF NOT EXISTS last_connected_at timestamptz;
 
 -- If your table has `updated_date` instead of `updated_at`, either rename:
 --   ALTER TABLE public.devices RENAME COLUMN updated_date TO updated_at;
